@@ -109,8 +109,33 @@ def load_model_and_tokenizer(
 
     logger.info("Loading model from %s (4-bit NF4, double_quant=True)", model_id)
 
-    # Flash Attention 2 requires compute_dtype=bfloat16 and CUDA ≥ 8.0 (A100 = 8.0 ✓)
-    # Fall back to "eager" if flash-attn is not installed
+    # Flash Attention 2 requires compute_dtype=bfloat16 and CUDA >= 8.0 (A100 = 8.0).
+    # Fall back to "eager" if flash-attn is not installed.
+    #
+    # Exception hierarchy to handle:
+    #   ImportError  — flash_attn package missing (raised by transformers directly)
+    #   ValueError   — attn_implementation value rejected by model config
+    #   RuntimeError — transformers wraps a deeper ImportError (e.g. bitsandbytes
+    #                  importing from triton.ops which was removed in Triton 3.x)
+    #                  as RuntimeError("Failed to import transformers.integrations...")
+    #
+    # The bitsandbytes/triton error is NOT related to Flash Attention and should NOT
+    # be silenced here — it means bitsandbytes itself is broken (wrong version).
+    # The check below only silences the fallback when the error is flash-attention-
+    # specific; all other errors are re-raised with a helpful message.
+
+    _FLASH_KEYWORDS = ("flash", "attn_implementation", "flash_attn")
+
+    def _is_flash_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(kw in msg for kw in _FLASH_KEYWORDS)
+
+    def _is_bnb_triton_error(exc: Exception) -> bool:
+        msg = str(exc)
+        return "triton.ops" in msg or "triton_based_modules" in msg or (
+            "bitsandbytes" in msg and "import" in msg.lower()
+        )
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
@@ -120,8 +145,14 @@ def load_model_and_tokenizer(
             attn_implementation=attn_implementation,
             torch_dtype=torch.bfloat16,
         )
-    except (ImportError, ValueError) as exc:
-        if "flash" in str(exc).lower() or "attn_implementation" in str(exc).lower():
+    except (ImportError, ValueError, RuntimeError) as exc:
+        if _is_bnb_triton_error(exc):
+            raise RuntimeError(
+                "bitsandbytes failed to import due to a Triton version mismatch.\n"
+                "This happens when bitsandbytes < 0.44.0 is installed alongside Triton 3.x.\n"
+                "Fix: run  pip install -U 'bitsandbytes>=0.44.0'  and restart the runtime."
+            ) from exc
+        if _is_flash_error(exc):
             logger.warning(
                 "Flash Attention 2 not available (%s). Falling back to eager attention.", exc
             )
