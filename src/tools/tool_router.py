@@ -258,6 +258,22 @@ class ToolRouter:
                     result = tool_fn(query, top_k=top_k)
                 else:
                     result = tool_fn(args_str.strip("'\" "))
+            elif tool_name == "parse_table":
+                # The format token ('markdown' or 'csv') is always the last
+                # comma-separated value. Everything before it is the table text,
+                # which may itself contain commas and real/literal newlines.
+                fmt = "markdown"
+                text_part = args_str.strip()
+                fmt_match = re.search(r",\s*['\"]?(markdown|csv)['\"]?\s*$", text_part)
+                if fmt_match:
+                    fmt = fmt_match.group(1)
+                    text_part = text_part[: fmt_match.start()]
+                text_part = text_part.strip().strip("'\"")
+                # Normalise literal two-char \n sequences to real newlines so
+                # the markdown line-splitter works regardless of how the caller
+                # built the args string.
+                text_part = text_part.replace("\\n", "\n")
+                result = tool_fn(text_part, fmt)
             else:
                 # Generic: try to parse as keyword args
                 try:
