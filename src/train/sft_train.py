@@ -177,28 +177,92 @@ def build_training_arguments(
 
 
 # ---------------------------------------------------------------------------
-# Dataset loader
+# Dataset loader (with auto-migration from old pre-tokenized format)
 # ---------------------------------------------------------------------------
 
-def load_datasets(data_dir: str) -> DatasetDict:
+def _needs_migration(ds: DatasetDict) -> bool:
+    """Return True if the dataset is in the old pre-tokenized format."""
+    first = next(iter(ds.values()))
+    return "prompt" not in first.column_names
+
+
+def _find_raw_jsonl(data_dir: str) -> Optional[str]:
+    """
+    Try to locate the source JSONL file by searching a few common locations
+    relative to the processed data directory.
+    """
     data_path = Path(data_dir)
+    candidates = [
+        data_path.parent.parent / "data" / "raw" / "synthetic.jsonl",
+        data_path.parent / "raw" / "synthetic.jsonl",
+        Path("data") / "raw" / "synthetic.jsonl",
+        Path("data/raw/synthetic.jsonl"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def load_datasets(data_dir: str) -> DatasetDict:
+    """
+    Load the preprocessed DatasetDict.
+
+    If the saved dataset is in the old pre-tokenized format (has 'input_ids'
+    instead of 'prompt'/'completion'), this function automatically re-runs
+    preprocessing from the raw JSONL and saves the result back to disk.
+    No manual intervention required.
+    """
+    data_path = Path(data_dir)
+
     if not data_path.exists() or not any(data_path.iterdir()):
         raise FileNotFoundError(
             f"Preprocessed data not found at {data_dir}. "
-            "Run: python -m src.data.synthetic_gen && python -m src.data.preprocess"
+            "Run: python -m src.data.synthetic_gen  then  python -m src.data.preprocess"
         )
+
     logger.info("Loading DatasetDict from %s", data_dir)
     ds = load_from_disk(str(data_dir))
 
-    # Validate format: new pipeline produces prompt/completion columns
-    first_split = next(iter(ds.values()))
-    if "prompt" not in first_split.column_names:
-        raise ValueError(
-            "Dataset is in the old pre-tokenized format (has 'input_ids' but no 'prompt'). "
-            "Re-run preprocessing: python -m src.data.preprocess\n"
-            "The new format uses {'prompt', 'completion', 'task'} columns."
+    if not _needs_migration(ds):
+        return ds
+
+    # ---- Auto-migration: old format detected --------------------------------
+    logger.warning(
+        "Dataset at '%s' is in the old pre-tokenized format (has 'input_ids'). "
+        "Automatically re-running preprocessing to generate the new "
+        "prompt-completion format.",
+        data_dir,
+    )
+
+    raw_jsonl = _find_raw_jsonl(data_dir)
+    if raw_jsonl is None:
+        raise FileNotFoundError(
+            f"Dataset at '{data_dir}' is in the old format and the source JSONL "
+            "could not be found automatically.\n"
+            "Fix: re-run the preprocessing cell in the notebook, or run:\n"
+            "  python -m src.data.preprocess --data_path data/raw/synthetic.jsonl"
         )
-    return ds
+
+    logger.info("Found raw JSONL at %s. Re-preprocessing now...", raw_jsonl)
+
+    from src.data.preprocess import load_and_format_dataset
+
+    new_ds = load_and_format_dataset(
+        data_path=raw_jsonl,
+        tokenizer=None,   # no tokenizer needed for prompt-completion format
+        seed=42,
+    )
+
+    # Save back to disk (overwrites old format)
+    new_ds.save_to_disk(str(data_path))
+    logger.info(
+        "Re-preprocessing complete. New format saved to %s. "
+        "Splits: %s",
+        data_dir,
+        {k: len(v) for k, v in new_ds.items()},
+    )
+    return new_ds
 
 
 # ---------------------------------------------------------------------------
