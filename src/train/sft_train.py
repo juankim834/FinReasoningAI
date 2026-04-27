@@ -52,6 +52,8 @@ def _parse_version(v: str) -> Tuple[int, ...]:
 
 _TRL_VERSION = _parse_version(importlib.metadata.version("trl"))
 _NEW_TRL = _TRL_VERSION >= (0, 20, 0)   # DataCollatorForCompletionOnlyLM removed
+# TRL 0.20+ renamed max_seq_length -> max_length in SFTConfig
+_TRL_USES_MAX_LENGTH = _TRL_VERSION >= (0, 20, 0)
 
 logger.debug("TRL version: %s  (new_api=%s)", _TRL_VERSION, _NEW_TRL)
 
@@ -162,15 +164,19 @@ def build_training_arguments(
     )
 
     if _NEW_TRL:
-        # SFTConfig-specific parameters
-        # max_seq_length lives on SFTConfig, not TrainingArguments
-        return _SFTOrTrainingArgs(
-            max_seq_length=max_seq_length,
-            packing=False,              # packing mixes task types -- keep off
-            completion_only_loss=True,  # loss only on completion tokens (new TRL default)
-            dataset_text_field=None,    # use prompt/completion columns, not a text column
-            **common_kwargs,
-        )
+        # SFTConfig-specific parameters.
+        # TRL 0.20+ renamed max_seq_length -> max_length; use the right name dynamically.
+        import inspect as _inspect
+        _sft_params = _inspect.signature(_SFTOrTrainingArgs.__init__).parameters
+        _len_kwarg = "max_length" if "max_length" in _sft_params else "max_seq_length"
+        _extra: dict = {_len_kwarg: max_seq_length, "packing": False}
+        # completion_only_loss and dataset_text_field were added in 0.20 but may be
+        # absent in some builds; only pass them when accepted.
+        if "completion_only_loss" in _sft_params:
+            _extra["completion_only_loss"] = True
+        if "dataset_text_field" in _sft_params:
+            _extra["dataset_text_field"] = None
+        return _SFTOrTrainingArgs(**_extra, **common_kwargs)
     else:
         # Old TRL: max_seq_length goes to SFTTrainer directly, not here
         return _SFTOrTrainingArgs(**common_kwargs)
