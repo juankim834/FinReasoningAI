@@ -144,6 +144,33 @@ def format_sample(sample: dict) -> str:
     return formatter(sample)
 
 
+# Sentinel string that separates the prompt from the completion inside a
+# full ChatML string.  This is the EXACT string appended by every formatter
+# before the assistant's response.
+ASSISTANT_TURN_START = "<|im_start|>assistant\n"
+
+
+def format_as_prompt_completion(sample: dict) -> dict:
+    """
+    Split a formatted ChatML string into a {"prompt": ..., "completion": ...}
+    dict.  This is the dataset format required by TRL >= 0.20.
+
+    prompt     = system + user turns + opening assistant tag
+    completion = assistant response + closing <|im_end|>
+
+    TRL uses this split to apply completion-only loss masking automatically
+    (equivalent to DataCollatorForCompletionOnlyLM in older TRL versions).
+    """
+    full_text = format_sample(sample)
+    split_idx = full_text.rfind(ASSISTANT_TURN_START)
+    if split_idx == -1:
+        # Fallback: treat everything as completion (no masking)
+        return {"prompt": "", "completion": full_text}
+    prompt = full_text[: split_idx + len(ASSISTANT_TURN_START)]
+    completion = full_text[split_idx + len(ASSISTANT_TURN_START):]
+    return {"prompt": prompt, "completion": completion}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Tokenization
 # ──────────────────────────────────────────────────────────────────────────────
@@ -310,7 +337,7 @@ def _denormalize_sample(row: dict) -> dict:
 
 def load_and_format_dataset(
     data_path: str,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
     max_length: int = 2048,
     train_frac: float = 0.90,
     val_frac: float = 0.05,
@@ -318,22 +345,30 @@ def load_and_format_dataset(
     num_proc: int = 4,
 ) -> DatasetDict:
     """
-    Load raw JSONL data, apply ChatML formatting, tokenize, and split.
+    Load raw JSONL data, apply ChatML formatting, and split into train/val/test.
+
+    Output format: {"prompt": str, "completion": str, "task": str}
+
+    This is the prompt-completion format expected by TRL >= 0.20 SFTTrainer.
+    SFTTrainer tokenizes the data itself at training time and applies
+    completion-only loss masking automatically (loss computed only on the
+    completion tokens, not the prompt).
+
+    The `tokenizer` argument is accepted for backward compatibility but is no
+    longer used for pre-tokenization -- SFTTrainer handles tokenization.
 
     Args:
-        data_path:   Path to a JSONL file (can also be a directory; all .jsonl
-                     files in the directory will be concatenated).
-        tokenizer:   Qwen2.5 tokenizer (must already be loaded).
-        max_length:  Maximum token length (2048 recommended for A100 80GB).
+        data_path:   Path to a JSONL file or directory of JSONL files.
+        tokenizer:   Unused (kept for API compatibility). Can be None.
+        max_length:  Passed through to SFTTrainer via sft_train.py.
         train_frac:  Fraction for training (default 0.90).
         val_frac:    Fraction for validation (default 0.05); test gets remainder.
         seed:        Reproducibility seed.
-        num_proc:    Parallel workers for tokenization.
+        num_proc:    Unused (SFTTrainer handles parallelism).
 
     Returns:
         DatasetDict with keys "train", "val", "test".
-
-    Memory: tokenized dataset at 2048 tokens × ~100K samples ≈ ~1.6 GB disk.
+        Each example has columns: "prompt", "completion", "task".
     """
     path = Path(data_path)
     raw_samples: List[dict] = []
@@ -352,31 +387,36 @@ def load_and_format_dataset(
     splits = stratified_split(raw_samples, train_frac=train_frac, val_frac=val_frac, seed=seed)
 
     dataset_dict = {}
-    truncation_counts: Dict[str, int] = {}
 
     for split_name, split_samples in splits.items():
         if not split_samples:
             continue
 
-        # Normalize to a uniform flat string schema so PyArrow can build
-        # a consistent Arrow table regardless of task type.
-        # (answer=float vs str, variables=dict vs absent, etc. all become str)
-        normalized = [_normalize_sample(s) for s in split_samples]
-        hf_dataset = Dataset.from_list(normalized)
+        # Format into prompt-completion pairs.
+        # _normalize_sample is used first to handle mixed types (float answers,
+        # dict fields) before PyArrow sees them, then _denormalize_sample
+        # restores the proper types for format_as_prompt_completion().
+        formatted_rows = []
+        for s in split_samples:
+            try:
+                normalized = _normalize_sample(s)
+                restored = _denormalize_sample(normalized)
+                pc = format_as_prompt_completion(restored)
+                formatted_rows.append({
+                    "prompt":     pc["prompt"],
+                    "completion": pc["completion"],
+                    "task":       s.get("task", "financial_qa"),
+                })
+            except Exception as exc:
+                logger.warning(
+                    "Skipping sample %s during formatting: %s",
+                    s.get("id", "?"), exc,
+                )
 
-        # Use map with batched=True for speed
-        tokenized = hf_dataset.map(
-            lambda batch: _tokenize_batch(batch, tokenizer, max_length),
-            batched=True,
-            batch_size=32,
-            num_proc=1,  # tokenizer is not process-safe; keep at 1
-            remove_columns=hf_dataset.column_names,
-            desc=f"Tokenizing {split_name}",
-        )
-
-        dataset_dict[split_name] = tokenized
+        hf_dataset = Dataset.from_list(formatted_rows)
+        dataset_dict[split_name] = hf_dataset
         logger.info(
-            "Split '%s': %d samples tokenized.", split_name, len(tokenized)
+            "Split '%s': %d prompt-completion pairs.", split_name, len(hf_dataset)
         )
 
     return DatasetDict(dataset_dict)
@@ -417,28 +457,55 @@ def _tokenize_batch(
     }
 
 
-def print_dataset_stats(dataset_dict: DatasetDict, tokenizer: PreTrainedTokenizerBase) -> None:
-    """Print dataset statistics including token length distribution."""
+def print_dataset_stats(
+    dataset_dict: DatasetDict,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+) -> None:
+    """
+    Print dataset statistics.
+
+    For prompt-completion datasets (new format): reports character lengths and
+    estimated token lengths (chars / 4 as a rough estimate, or exact if tokenizer
+    is provided).
+    """
     import numpy as np
 
     for split, ds in dataset_dict.items():
-        lengths = [len(ids) for ids in ds["input_ids"]]
+        n = len(ds)
+        if "input_ids" in ds.column_names:
+            # Legacy pre-tokenized format
+            lengths = [len(ids) for ids in ds["input_ids"]]
+        elif "prompt" in ds.column_names and "completion" in ds.column_names:
+            # New prompt-completion format: estimate token length
+            if tokenizer is not None:
+                lengths = []
+                for row in ds.select(range(min(200, n))):
+                    full = row["prompt"] + row["completion"]
+                    lengths.append(len(tokenizer.encode(full, add_special_tokens=False)))
+                if n > 200:
+                    logger.info(
+                        "Split %-8s | n=%6d | token lengths estimated from first 200 samples",
+                        split, n,
+                    )
+            else:
+                # Rough estimate: ~4 chars per token
+                lengths = [(len(r["prompt"]) + len(r["completion"])) // 4
+                           for r in ds]
+        else:
+            logger.info("Split %-8s | n=%6d | (unknown format)", split, n)
+            continue
+
+        if not lengths:
+            continue
+
         logger.info(
             "Split %-8s | n=%6d | avg_len=%6.0f | p50=%5d | p95=%5d | max=%5d",
-            split, len(ds),
+            split, n,
             float(np.mean(lengths)),
             int(np.percentile(lengths, 50)),
             int(np.percentile(lengths, 95)),
             max(lengths),
         )
-        trunc_rate = sum(1 for l in lengths if l >= 2048) / len(lengths) * 100
-        if trunc_rate > 20:
-            warnings.warn(
-                f"High truncation rate in split '{split}': {trunc_rate:.1f}% of samples "
-                f"hit max_length=2048. Consider increasing max_length.",
-                UserWarning,
-                stacklevel=2,
-            )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

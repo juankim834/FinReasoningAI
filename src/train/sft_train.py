@@ -1,63 +1,81 @@
 """
 File: src/train/sft_train.py
 
-Steps 3 & 4 — SFT Training Pipeline
+Steps 3 & 4 -- SFT Training Pipeline
 
-Training strategy rationale:
-  - effective_batch = per_device_batch(4) × grad_accum(8) = 32. This is the
-    standard "sweet spot" for instruction fine-tuning: large enough to stabilize
-    gradients, small enough to fit in A100 80GB with grad checkpointing.
-  - cosine schedule + 50-step warmup: cosine decay is more stable than linear
-    for fine-tuning; warmup prevents large early updates from destroying
-    pretrained weights.
-  - paged_adamw_32bit: offloads optimizer state pages to CPU RAM on demand,
-    reducing peak VRAM by ~8–12 GB vs standard AdamW32bit.
-  - bf16=True, fp16=False: BF16 has wider dynamic range than FP16, critical
-    for financial arithmetic where numbers span many orders of magnitude.
+TRL version compatibility:
+  - TRL >= 0.20.0: DataCollatorForCompletionOnlyLM was removed.
+    Use SFTConfig + prompt-completion dataset format.
+    Completion-only loss is automatic when the dataset has "prompt"/"completion"
+    columns (no DataCollator needed).
+  - TRL < 0.20.0: Use TrainingArguments + DataCollatorForCompletionOnlyLM.
+    Dataset must have pre-tokenized "input_ids" column.
 
-CoT scratchpad suppression strategy:
-  - Training: ~10% of samples include <think>...</think> blocks in the
-    assistant turn. The model learns to reason internally when prompted with
-    the CoT system prompt.
-  - Inference (default mode): system prompt instructs direct answering;
-    if any <think> leaks into output, it is stripped by post-processing.
-  - Inference (CoT mode): use COT_SYSTEM_PROMPT; let the model output the
-    full scratchpad, then extract the final answer after </think>.
-  - This is superior to training without CoT entirely because it gives the
-    model latent reasoning capacity that improves accuracy on numerical chains
-    even in non-CoT mode.
+This file detects the TRL version at import time and selects the right path.
+
+Training config summary:
+  - Effective batch size: 4 x 8 = 32
+  - cosine LR schedule + 50-step warmup
+  - paged_adamw_32bit: offloads optimizer state pages to CPU (~8-12 GB savings)
+  - bf16: wider dynamic range than fp16 for financial number magnitudes
+  - gradient_checkpointing: ~30% VRAM savings at ~25% compute cost
 
 Memory estimate at bs=4, grad_ckpt=True, max_len=2048, bf16:
-  - Base model (4-bit NF4):  ~8.5 GB
-  - LoRA adapters + grads:   ~0.6 GB
-  - Optimizer states (paged): ~2.0 GB (paged to CPU)
-  - Activations (with ckpt): ~14.0 GB
-  - KV cache + misc:          ~6.0 GB
-  Total estimated:            ~31 GB — fits A100 80GB with comfortable margin [OK]
+  - Base model (4-bit NF4):     ~8.5 GB
+  - LoRA adapters + grads:      ~0.6 GB
+  - Optimizer (paged to CPU):   ~2.0 GB
+  - Activations (grad ckpt):    ~14.0 GB
+  - KV cache + misc:            ~6.0 GB
+  Total:                        ~31 GB -- fits A100 80GB
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from datasets import DatasetDict, load_from_disk
 from peft import LoraConfig, TaskType
-from transformers import (
-    AutoTokenizer,
-    EarlyStoppingCallback,
-    TrainingArguments,
-)
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config defaults
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# TRL version detection
+# ---------------------------------------------------------------------------
+
+def _parse_version(v: str) -> Tuple[int, ...]:
+    return tuple(int(x) for x in v.split(".")[:3] if x.isdigit())
+
+_TRL_VERSION = _parse_version(importlib.metadata.version("trl"))
+_NEW_TRL = _TRL_VERSION >= (0, 20, 0)   # DataCollatorForCompletionOnlyLM removed
+
+logger.debug("TRL version: %s  (new_api=%s)", _TRL_VERSION, _NEW_TRL)
+
+if _NEW_TRL:
+    # TRL >= 0.20: use SFTConfig (inherits from TrainingArguments)
+    from trl import SFTTrainer, SFTConfig as _SFTOrTrainingArgs
+else:
+    # TRL < 0.20: use TrainingArguments + DataCollatorForCompletionOnlyLM
+    try:
+        from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+    except ImportError:
+        from trl import SFTTrainer
+        from trl.trainer.utils import DataCollatorForCompletionOnlyLM
+    from transformers import TrainingArguments as _SFTOrTrainingArgs
+
+from transformers import (
+    AutoTokenizer,
+    EarlyStoppingCallback,
+    PreTrainedTokenizerBase,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 DEFAULT_OUTPUT_DIR = "outputs/sft_qlora"
@@ -73,11 +91,13 @@ QLORA_CONFIG = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
 )
 
-# Response template tells DataCollatorForCompletionOnlyLM where the
-# assistant's answer starts — only labels those tokens, not the prompt.
-# This is critical: we do NOT want to train the model to reproduce its own prompt.
+# Used only by the old TRL path to detect the assistant response start token
 RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
 
+
+# ---------------------------------------------------------------------------
+# Training arguments builder
+# ---------------------------------------------------------------------------
 
 def build_training_arguments(
     output_dir: str = DEFAULT_OUTPUT_DIR,
@@ -90,14 +110,11 @@ def build_training_arguments(
     logging_steps: int = 10,
     eval_steps: int = 100,
     save_steps: int = 200,
-    early_stopping_patience: int = 5,
     use_wandb: bool = False,
-) -> TrainingArguments:
+):
     """
-    Build HuggingFace TrainingArguments for QLoRA SFT.
-
-    Effective batch size = per_device_train_batch_size × gradient_accumulation_steps
-                        = 4 × 8 = 32
+    Build SFTConfig (new TRL) or TrainingArguments (old TRL).
+    The returned object is passed directly to SFTTrainer(args=...).
     """
     if use_wandb and not os.environ.get("WANDB_API_KEY"):
         logger.warning("WANDB_API_KEY not set. Disabling W&B logging.")
@@ -106,13 +123,13 @@ def build_training_arguments(
     report_to = ["wandb"] if use_wandb else ["none"]
     os.environ.setdefault("WANDB_PROJECT", "finreasoningai-sft")
 
-    return TrainingArguments(
+    common_kwargs = dict(
         output_dir=output_dir,
-        # Batch & accumulation
+        # Batch
         per_device_train_batch_size=per_device_train_batch_size,
         per_device_eval_batch_size=2,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        # Epochs & scheduling
+        # Schedule
         num_train_epochs=num_train_epochs,
         lr_scheduler_type="cosine",
         warmup_steps=warmup_steps,
@@ -120,14 +137,13 @@ def build_training_arguments(
         # Precision
         fp16=False,
         bf16=True,
-        # Memory optimizations
+        # Memory
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim="paged_adamw_32bit",   # paged optimizer: VRAM-efficient
-        # DataLoader
+        optim="paged_adamw_32bit",
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
-        # Logging & saving
+        # Logging / saving
         logging_steps=logging_steps,
         logging_first_step=True,
         eval_strategy="steps",
@@ -138,22 +154,33 @@ def build_training_arguments(
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        # Reproducibility
         seed=42,
         data_seed=42,
-        # Reporting
         report_to=report_to,
         run_name="finreasoningai-sft-qlora",
-        # Remove unused columns so HF doesn't crash on custom columns (e.g., "task")
-        remove_unused_columns=True,
+        remove_unused_columns=False,   # keep "task" column for logging
     )
 
+    if _NEW_TRL:
+        # SFTConfig-specific parameters
+        # max_seq_length lives on SFTConfig, not TrainingArguments
+        return _SFTOrTrainingArgs(
+            max_seq_length=max_seq_length,
+            packing=False,              # packing mixes task types -- keep off
+            completion_only_loss=True,  # loss only on completion tokens (new TRL default)
+            dataset_text_field=None,    # use prompt/completion columns, not a text column
+            **common_kwargs,
+        )
+    else:
+        # Old TRL: max_seq_length goes to SFTTrainer directly, not here
+        return _SFTOrTrainingArgs(**common_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Dataset loader
+# ---------------------------------------------------------------------------
 
 def load_datasets(data_dir: str) -> DatasetDict:
-    """
-    Load preprocessed DatasetDict from disk.
-    Falls back to synthetic generation if the directory is empty.
-    """
     data_path = Path(data_dir)
     if not data_path.exists() or not any(data_path.iterdir()):
         raise FileNotFoundError(
@@ -161,8 +188,22 @@ def load_datasets(data_dir: str) -> DatasetDict:
             "Run: python -m src.data.synthetic_gen && python -m src.data.preprocess"
         )
     logger.info("Loading DatasetDict from %s", data_dir)
-    return load_from_disk(str(data_dir))
+    ds = load_from_disk(str(data_dir))
 
+    # Validate format: new pipeline produces prompt/completion columns
+    first_split = next(iter(ds.values()))
+    if "prompt" not in first_split.column_names:
+        raise ValueError(
+            "Dataset is in the old pre-tokenized format (has 'input_ids' but no 'prompt'). "
+            "Re-run preprocessing: python -m src.data.preprocess\n"
+            "The new format uses {'prompt', 'completion', 'task'} columns."
+        )
+    return ds
+
+
+# ---------------------------------------------------------------------------
+# Main training entry point
+# ---------------------------------------------------------------------------
 
 def main(
     model_id: str = DEFAULT_MODEL_ID,
@@ -177,63 +218,66 @@ def main(
     resume_from_checkpoint: Optional[str] = None,
 ) -> None:
     """
-    End-to-end SFT training pipeline:
-      1. Load model + tokenizer in 4-bit NF4
+    End-to-end SFT training:
+      1. Load Qwen2.5-14B in 4-bit NF4
       2. Apply QLoRA adapters
-      3. Load & prepare dataset
-      4. Configure SFTTrainer with EarlyStopping
+      3. Load prompt-completion dataset
+      4. Build SFTTrainer (TRL version-aware)
       5. Train and save adapter
-
-    [WARN] TRADE-OFF: SFTTrainer's completion-only masking (DataCollatorForCompletionOnlyLM)
-    only computes loss on the assistant response tokens, not on the prompt.
-    This is correct for instruction tuning but means the model doesn't learn to
-    generate the system prompt or user turn — intentional.
     """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    # ── 1. Check hardware ──────────────────────────────────────────────────
+    # -- Hardware check -------------------------------------------------------
     if not torch.cuda.is_available():
         raise EnvironmentError(
-            "No CUDA GPU detected. QLoRA training requires a CUDA GPU (A100 80GB recommended)."
+            "No CUDA GPU detected. QLoRA training requires a GPU (A100 80GB recommended)."
         )
     gpu_name = torch.cuda.get_device_name(0)
     total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    logger.info("GPU: %s | Total VRAM: %.1f GB", gpu_name, total_vram_gb)
+    logger.info("GPU: %s | VRAM: %.1f GB", gpu_name, total_vram_gb)
     if total_vram_gb < 40.0:
         logger.warning(
-            "GPU has only %.1f GB VRAM. Minimum recommended is 40 GB. "
-            "Try reducing per_device_train_batch_size to 2.",
-            total_vram_gb,
+            "GPU has only %.1f GB VRAM. Try per_device_train_batch_size=2.", total_vram_gb
         )
 
-    # ── 2. Load model & tokenizer ──────────────────────────────────────────
+    trl_ver_str = importlib.metadata.version("trl")
+    logger.info("TRL version: %s  (using %s API)",
+                trl_ver_str, "SFTConfig" if _NEW_TRL else "TrainingArguments")
+
+    # -- Load model + tokenizer -----------------------------------------------
     from src.model.load_model import load_model_and_tokenizer, DEFAULT_BNB_CONFIG
+
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+    except ImportError:
+        attn_impl = "eager"
 
     model, tokenizer = load_model_and_tokenizer(
         model_id=model_id,
         bnb_config=DEFAULT_BNB_CONFIG,
+        attn_implementation=attn_impl,
     )
 
-    # ── 3. Apply QLoRA ────────────────────────────────────────────────────
+    # -- Apply QLoRA ----------------------------------------------------------
     from src.model.apply_lora import apply_qlora
 
     model = apply_qlora(model, lora_config=QLORA_CONFIG, gradient_checkpointing=True)
 
-    # ── 4. Load dataset ───────────────────────────────────────────────────
+    # -- Load dataset ---------------------------------------------------------
     dataset = load_datasets(data_dir)
     train_ds = dataset["train"]
     val_ds = dataset.get("val", dataset.get("validation"))
 
     logger.info(
-        "Dataset — train: %d, val: %d",
-        len(train_ds),
-        len(val_ds) if val_ds else 0,
+        "Dataset -- train: %d, val: %d",
+        len(train_ds), len(val_ds) if val_ds else 0,
     )
 
-    # ── 5. Build training arguments ───────────────────────────────────────
+    # -- Training arguments ---------------------------------------------------
     training_args = build_training_arguments(
         output_dir=output_dir,
         num_train_epochs=num_train_epochs,
@@ -244,78 +288,75 @@ def main(
         use_wandb=use_wandb,
     )
 
-    # ── 6. Completion-only data collator ──────────────────────────────────
-    # Only compute loss on tokens AFTER the response template.
-    # This prevents the model from memorizing the prompt format.
-    response_template_ids = tokenizer.encode(
-        RESPONSE_TEMPLATE, add_special_tokens=False
-    )
-    data_collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template_ids,
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    # -- SFTTrainer -----------------------------------------------------------
+    callbacks = [EarlyStoppingCallback(early_stopping_patience=5)]
 
-    # ── 7. SFTTrainer ─────────────────────────────────────────────────────
-    callbacks = [
-        EarlyStoppingCallback(early_stopping_patience=5),
-    ]
+    if _NEW_TRL:
+        # TRL >= 0.20: pass args=SFTConfig; dataset has "prompt"/"completion" columns;
+        # completion-only loss is handled automatically.
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            callbacks=callbacks,
+        )
+    else:
+        # TRL < 0.20: use response-template-based DataCollator for masking
+        response_template_ids = tokenizer.encode(
+            RESPONSE_TEMPLATE, add_special_tokens=False
+        )
+        data_collator = DataCollatorForCompletionOnlyLM(
+            response_template=response_template_ids,
+            tokenizer=tokenizer,
+            mlm=False,
+        )
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=data_collator,
+            callbacks=callbacks,
+            max_seq_length=max_seq_length,
+            dataset_text_field=None,
+            packing=False,
+        )
 
-    # Try to import WandB callback
-    if use_wandb:
-        try:
-            from transformers.integrations import WandbCallback
-            callbacks.append(WandbCallback())
-        except ImportError:
-            logger.warning("WandbCallback not available.")
-
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        data_collator=data_collator,
-        callbacks=callbacks,
-        # SFTTrainer-specific
-        max_seq_length=max_seq_length,
-        dataset_text_field=None,   # dataset is already tokenized
-        packing=False,             # packing can mix samples from different tasks
-    )
-
-    # ── 8. Train ──────────────────────────────────────────────────────────
+    # -- Train ----------------------------------------------------------------
     logger.info("=" * 60)
     logger.info("Starting SFT training")
-    logger.info("  Model:          %s", model_id)
-    logger.info("  Epochs:         %d", num_train_epochs)
-    logger.info("  Effective BS:   %d (×%d ×%d)", per_device_train_batch_size *
-                gradient_accumulation_steps, per_device_train_batch_size,
-                gradient_accumulation_steps)
-    logger.info("  LR:             %.2e", learning_rate)
-    logger.info("  Max seq length: %d", max_seq_length)
-    logger.info("  Output dir:     %s", output_dir)
+    logger.info("  Model       : %s", model_id)
+    logger.info("  TRL version : %s", trl_ver_str)
+    logger.info("  Epochs      : %d", num_train_epochs)
+    logger.info("  Eff. batch  : %d (bs=%d x accum=%d)",
+                per_device_train_batch_size * gradient_accumulation_steps,
+                per_device_train_batch_size, gradient_accumulation_steps)
+    logger.info("  LR          : %.2e", learning_rate)
+    logger.info("  Max seq len : %d", max_seq_length)
+    logger.info("  Output      : %s", output_dir)
     logger.info("=" * 60)
 
     if torch.cuda.is_available():
-        vram_before = torch.cuda.memory_allocated() / 1e9
-        logger.info("VRAM before training: %.1f GB", vram_before)
+        logger.info("VRAM before training: %.1f GB", torch.cuda.memory_allocated() / 1e9)
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    # ── 9. Save adapter ───────────────────────────────────────────────────
+    # -- Save adapter ---------------------------------------------------------
     adapter_dir = Path(output_dir) / "final_adapter"
     trainer.model.save_pretrained(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
+    logger.info("SFT training complete. Adapter saved to %s", adapter_dir)
 
-    logger.info("[OK] SFT training complete. Adapter saved to %s", adapter_dir)
-
-    # Print final metrics
     if trainer.state.best_metric is not None:
         logger.info("Best eval loss: %.4f", trainer.state.best_metric)
-
     if torch.cuda.is_available():
-        peak_vram = torch.cuda.max_memory_allocated() / 1e9
-        logger.info("Peak VRAM during training: %.1f GB", peak_vram)
+        logger.info("Peak VRAM: %.1f GB", torch.cuda.max_memory_allocated() / 1e9)
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse

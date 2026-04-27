@@ -46,7 +46,12 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType, PeftModel
 from transformers import AutoTokenizer, TrainingArguments
-from trl import DPOTrainer, DPOConfig
+# DPOConfig was added in TRL 0.9; older versions used TrainingArguments directly.
+try:
+    from trl import DPOTrainer, DPOConfig
+except ImportError:
+    from trl import DPOTrainer
+    from transformers import TrainingArguments as DPOConfig  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
