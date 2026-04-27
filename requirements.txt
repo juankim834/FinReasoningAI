@@ -1,0 +1,52 @@
+# FinReasoningAI — dependency manifest
+# Tested on Python 3.10+, single A100 80GB GPU
+
+# Core ML
+torch>=2.2.0
+torchvision>=0.17.0
+torchaudio>=2.2.0
+
+# Hugging Face ecosystem
+transformers>=4.40.0
+datasets>=2.19.0
+accelerate>=0.30.0
+peft>=0.10.0
+trl>=0.8.6
+bitsandbytes>=0.43.0
+tokenizers>=0.19.0
+
+# Flash Attention 2 (install separately if CUDA driver supports it)
+# pip install flash-attn --no-build-isolation
+
+# Evaluation
+evaluate>=0.4.1
+rouge-score>=0.1.2
+nltk>=3.8.1
+scikit-learn>=1.4.0
+
+# Inference & serving
+vllm>=0.4.0               # optional, for high-throughput serving
+sentencepiece>=0.2.0
+
+# RAG dependencies
+faiss-cpu>=1.8.0           # use faiss-gpu if GPU FAISS is available
+langchain>=0.2.0
+langchain-community>=0.2.0
+FlagEmbedding>=1.2.9       # bge-m3 embeddings
+
+# Data / utilities
+pandas>=2.2.0
+numpy>=1.26.0
+scipy>=1.13.0
+tqdm>=4.66.0
+pydantic>=2.7.0
+jsonlines>=4.0.0
+PyYAML>=6.0.1
+python-dotenv>=1.0.1
+
+# Logging & experiment tracking
+wandb>=0.17.0              # optional; set WANDB_DISABLED=true to skip
+
+# Testing
+pytest>=8.2.0
+pytest-cov>=5.0.0

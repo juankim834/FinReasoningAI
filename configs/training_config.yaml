@@ -1,0 +1,90 @@
+# FinReasoning AI — Training Configuration
+# All values match the Agent.md specification.
+# Override any value via CLI flag when calling sft_train.py or dpo_train.py.
+
+model:
+  model_id: "Qwen/Qwen2.5-14B-Instruct"
+  attn_implementation: "flash_attention_2"   # or "eager" if flash-attn not installed
+
+quantization:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_use_double_quant: true
+
+lora:
+  r: 64
+  lora_alpha: 128
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+sft:
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 8       # effective_batch = 4 * 8 = 32
+  num_train_epochs: 3
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_steps: 50
+  max_seq_length: 2048
+  gradient_checkpointing: true
+  optim: "paged_adamw_32bit"
+  fp16: false
+  bf16: true
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 200
+  early_stopping_patience: 5
+  output_dir: "outputs/sft_qlora"
+  data_dir: "data/processed"
+
+dpo:
+  beta: 0.1
+  max_length: 1024
+  max_prompt_length: 768
+  num_train_epochs: 1
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-5
+  output_dir: "outputs/dpo_qlora"
+
+data:
+  synthetic_output: "data/raw/synthetic.jsonl"
+  total_synthetic_samples: 5000
+  numerical_fraction: 0.30
+  train_frac: 0.90
+  val_frac: 0.05
+  max_length: 2048
+  seed: 42
+
+inference:
+  default_use_cot: false
+  self_consistency_n: 1             # set to 8 for highest accuracy
+  temperature: 0.0                  # 0.0 = greedy
+  max_new_tokens: 256
+  grounding_check: true
+  min_confidence: 0.30
+
+rag:
+  embedding_model: "BAAI/bge-m3"
+  reranker_model: "BAAI/bge-reranker-v2-m3"
+  chunk_size: 512
+  chunk_overlap: 64
+  top_k: 20
+  top_r: 2
+  index_dir: "outputs/rag_index"
+
+evaluation:
+  output_csv: "outputs/eval_results.csv"
+  exact_match_tolerance: 1.0e-4     # 0.01% relative error
+  grounding_tolerance: 0.02         # 2% relative error for context verification
