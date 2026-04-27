@@ -246,6 +246,68 @@ def stratified_split(
     return splits
 
 
+def _normalize_sample(sample: dict) -> dict:
+    """
+    Flatten a raw sample into a schema that PyArrow can build a uniform
+    Arrow table from.
+
+    Root cause of ArrowTypeError:
+      - `answer` can be float (numerical_reasoning) or str (all others).
+        PyArrow infers the column type from the first row; a later float
+        in a str column (or vice-versa) raises ArrowTypeError.
+      - `variables` and `financial_data` are dicts, which are absent in
+        most rows (None). PyArrow cannot unify dict and NullType columns.
+      - `reasoning` is sometimes None and sometimes str; that is fine
+        because Arrow has a nullable string type, but we convert explicitly
+        to be safe.
+
+    Strategy: convert every field to a plain Python str, preserving the
+    data needed by format_sample() while giving PyArrow a uniform schema.
+    The tokenization step calls format_sample() on the raw dict, so
+    dict-typed fields must be reconstructed there — we JSON-serialize them
+    here and deserialize inside format_sample()-aware paths.
+    """
+    out = {
+        "id":          str(sample.get("id", "")),
+        "task":        str(sample.get("task", "financial_qa")),
+        "instruction": str(sample.get("instruction", "")),
+        "context":     str(sample.get("context", "")),
+        "question":    str(sample.get("question", "")),
+        # answer may be float or str — always coerce to str
+        "answer":      str(sample.get("answer", "")),
+        "reasoning":   str(sample.get("reasoning", "") or ""),
+        "unit":        str(sample.get("unit", "") or ""),
+        # dict fields: JSON-serialize so every row is a str
+        "variables":   json.dumps(sample.get("variables") or {}),
+        "financial_data": json.dumps(sample.get("financial_data") or {}),
+        "expression":  str(sample.get("expression", "") or ""),
+        "format":      str(sample.get("format", "") or ""),
+    }
+    return out
+
+
+def _denormalize_sample(row: dict) -> dict:
+    """
+    Reverse _normalize_sample: restore JSON-serialized fields back to
+    Python dicts so that format_sample() receives the expected types.
+    """
+    row = dict(row)
+    try:
+        row["variables"] = json.loads(row.get("variables") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        row["variables"] = {}
+    try:
+        row["financial_data"] = json.loads(row.get("financial_data") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        row["financial_data"] = {}
+    # Restore None for empty optional fields
+    if not row.get("reasoning"):
+        row["reasoning"] = None
+    if not row.get("unit"):
+        row["unit"] = None
+    return row
+
+
 def load_and_format_dataset(
     data_path: str,
     tokenizer: PreTrainedTokenizerBase,
@@ -296,34 +358,15 @@ def load_and_format_dataset(
         if not split_samples:
             continue
 
-        # Track truncations
-        trunc_before = {
-            task: 0 for task in ["financial_qa", "numerical_reasoning", "structured_analysis"]
-        }
-
-        hf_dataset = Dataset.from_list(split_samples)
-
-        def _tokenize(batch: dict) -> dict:
-            results = {
-                "input_ids": [],
-                "attention_mask": [],
-                "labels": [],
-                "task": [],
-            }
-            for i in range(len(batch["id"] if "id" in batch else batch.get("question", []))):
-                sample = {k: batch[k][i] for k in batch}
-                tok = tokenize_sample(sample, tokenizer, max_length)
-                results["input_ids"].append(tok["input_ids"])
-                results["attention_mask"].append(tok["attention_mask"])
-                results["labels"].append(tok["labels"])
-                results["task"].append(tok["task"])
-            return results
+        # Normalize to a uniform flat string schema so PyArrow can build
+        # a consistent Arrow table regardless of task type.
+        # (answer=float vs str, variables=dict vs absent, etc. all become str)
+        normalized = [_normalize_sample(s) for s in split_samples]
+        hf_dataset = Dataset.from_list(normalized)
 
         # Use map with batched=True for speed
         tokenized = hf_dataset.map(
-            lambda batch: {
-                **_tokenize_batch(batch, tokenizer, max_length)
-            },
+            lambda batch: _tokenize_batch(batch, tokenizer, max_length),
             batched=True,
             batch_size=32,
             num_proc=1,  # tokenizer is not process-safe; keep at 1
@@ -344,12 +387,22 @@ def _tokenize_batch(
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
 ) -> dict:
-    """Batch tokenization helper for HuggingFace .map()."""
+    """
+    Batch tokenization helper for HuggingFace .map().
+
+    Rows arrive from Dataset as normalized flat strings (_normalize_sample).
+    We denormalize each row back to the expected Python types before passing
+    to tokenize_sample() -> format_sample(), which needs:
+      - variables:      dict[str, float]   (numerical_reasoning)
+      - financial_data: dict               (structured_analysis)
+      - reasoning:      str | None
+    """
     input_ids_list, attention_mask_list, labels_list, task_list = [], [], [], []
 
     n = len(next(iter(batch.values())))
     for i in range(n):
-        sample = {k: v[i] for k, v in batch.items()}
+        raw = {k: v[i] for k, v in batch.items()}
+        sample = _denormalize_sample(raw)
         tok = tokenize_sample(sample, tokenizer, max_length)
         input_ids_list.append(tok["input_ids"])
         attention_mask_list.append(tok["attention_mask"])
