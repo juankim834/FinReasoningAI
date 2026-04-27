@@ -229,6 +229,44 @@ def load_jsonl(path: str) -> List[dict]:
     return records
 
 
+def load_eval_test_samples(
+    data_path: str,
+    train_frac: float = 0.90,
+    val_frac: float = 0.05,
+    seed: int = 42,
+) -> List[dict]:
+    """
+    Load raw JSONL file(s) and return the **test** split with fields restored for
+    evaluation (same stratified split as `load_and_format_dataset`).
+
+    Use this instead of `load_from_disk('data/processed')['test']` for evaluation:
+    the processed dataset only stores prompt/completion/task and omits answer,
+    question, and context.
+    """
+    path = Path(data_path)
+    raw_samples: List[dict] = []
+
+    if path.is_dir():
+        for jl_file in sorted(path.glob("*.jsonl")):
+            raw_samples.extend(load_jsonl(str(jl_file)))
+            logger.info("Loaded %s", jl_file)
+    elif path.is_file():
+        raw_samples = load_jsonl(str(path))
+    else:
+        raise FileNotFoundError(f"data_path not found: {data_path}")
+
+    splits = stratified_split(
+        raw_samples, train_frac=train_frac, val_frac=val_frac, seed=seed
+    )
+    test_rows = splits.get("test", [])
+    out: List[dict] = []
+    for s in test_rows:
+        normalized = _normalize_sample(s)
+        out.append(_denormalize_sample(normalized))
+    logger.info("Eval test split: %d samples (from %d raw rows)", len(out), len(raw_samples))
+    return out
+
+
 def stratified_split(
     samples: List[dict],
     train_frac: float = 0.90,

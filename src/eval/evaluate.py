@@ -237,15 +237,13 @@ def generate_prediction(
     max_new_tokens: int = 128,
 ) -> str:
     """Generate a single prediction for a sample using greedy decoding."""
-    from src.data.preprocess import format_sample
+    # Use the same ChatML prompt as training (handles financial_qa, numerical_reasoning, etc.)
+    from src.data.preprocess import format_as_prompt_completion
 
-    # Build prompt (no assistant turn)
-    from src.inference.generate import build_prompt
-    prompt = build_prompt(
-        question=sample.get("question", ""),
-        context=sample.get("context", ""),
-        instruction=sample.get("instruction", ""),
-    )
+    pc = format_as_prompt_completion(sample)
+    prompt = pc["prompt"]
+    if not prompt.strip():
+        logger.warning("Empty prompt for sample id=%s task=%s", sample.get("id"), sample.get("task"))
 
     inputs = tokenizer(
         prompt,
