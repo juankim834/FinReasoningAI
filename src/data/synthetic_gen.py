@@ -28,8 +28,9 @@ import logging
 import random
 import re
 import uuid
+from collections import Counter
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,129 @@ def generate_numerical_samples(n: int = 1500, seed: int = 42) -> List[dict]:
         })
 
     logger.info("Generated %d numerical reasoning samples.", len(samples))
+    return samples
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Template-based structured analysis (Type C)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def generate_structured_analysis_samples(n: int = 500, seed: int = 42) -> List[dict]:
+    """
+    Generate Type C (structured_analysis) samples from markdown tables + KPI dicts.
+    No LLM required — templates only, aligned with StructuredAnalysis / preprocess.
+    """
+    rng = random.Random(seed)
+    samples: List[dict] = []
+
+    for i in range(n):
+        company = rng.choice(COMPANIES)
+        fin = _random_financials(seed=seed + i + 50000)
+        ya, yb = fin["year_a"], fin["year_b"]
+        ebitda_a = fin["revenue_a"] * (fin["ebitda_b"] / max(fin["revenue_b"], 1e-9))
+        cogs_a = fin["revenue_a"] * (fin["cogs_b"] / max(fin["revenue_b"], 1e-9))
+        gp_a = (1.0 - cogs_a / max(fin["revenue_a"], 1e-9)) * 100
+        gp_b = (1.0 - fin["cogs_b"] / max(fin["revenue_b"], 1e-9)) * 100
+        debt_eq_a = fin["debt_b"] / max(fin["equity_b"], 1e-9) * rng.uniform(0.85, 1.05)
+        debt_eq_b = fin["debt_b"] / max(fin["equity_b"], 1e-9)
+
+        financial_data = {
+            "company": company,
+            "years": [ya, yb],
+            "revenue_m": {str(ya): round(fin["revenue_a"], 2), str(yb): round(fin["revenue_b"], 2)},
+            "ebitda_m": {str(ya): round(ebitda_a, 2), str(yb): round(fin["ebitda_b"], 2)},
+            "gross_margin_pct": {str(ya): round(gp_a, 2), str(yb): round(gp_b, 2)},
+            "debt_to_equity": {str(ya): round(debt_eq_a, 3), str(yb): round(debt_eq_b, 3)},
+        }
+
+        md_lines = [
+            f"### {company} — summary financials ($M except margins and ratios)",
+            "",
+            f"| Metric | {ya} | {yb} |",
+            "|---|---:|---:|",
+            f"| Revenue | {fin['revenue_a']:,.1f} | {fin['revenue_b']:,.1f} |",
+            f"| EBITDA | {ebitda_a:,.1f} | {fin['ebitda_b']:,.1f} |",
+            f"| Gross margin (%) | {gp_a:.2f} | {gp_b:.2f} |",
+            f"| Debt / equity (x) | {debt_eq_a:.3f} | {debt_eq_b:.3f} |",
+        ]
+        context = "\n".join(md_lines)
+
+        variant = rng.randint(0, 3)
+        fmt: str = rng.choice(["paragraph", "bullet"])
+        if variant == 0:
+            higher_rev = yb if fin["revenue_b"] >= fin["revenue_a"] else ya
+            question = (
+                f"Using the table, which fiscal year had higher reported revenue for {company}, "
+                f"{ya} or {yb}, and what were the approximate revenue figures ($M)?"
+            )
+            answer = (
+                f"{higher_rev} had higher revenue: approximately "
+                f"${fin['revenue_a']:,.0f}M in {ya} vs ${fin['revenue_b']:,.0f}M in {yb}."
+            )
+            unit = "$M"
+            reasoning = (
+                f"Compare the Revenue row for {ya} and {yb}. "
+                f"The larger value corresponds to the year with higher revenue."
+            )
+        elif variant == 1:
+            margin_trend = "improved" if gp_b >= gp_a else "weakened"
+            question = (
+                f"How did {company}'s gross margin (%) move from {ya} to {yb} according to the table?"
+            )
+            answer = (
+                f"Gross margin {margin_trend}: from {gp_a:.2f}% in {ya} to {gp_b:.2f}% in {yb}."
+            )
+            unit = "%"
+            reasoning = (
+                f"Read Gross margin row: {gp_a:.2f}% vs {gp_b:.2f}%. "
+                f"Determine direction of change and state both levels."
+            )
+        elif variant == 2:
+            eb_a, eb_b = ebitda_a, fin["ebitda_b"]
+            higher_ebitda = yb if eb_b >= eb_a else ya
+            diff = abs(eb_b - eb_a)
+            question = (
+                f"In which year was EBITDA higher for {company}, and by about how many $M?"
+            )
+            answer = (
+                f"EBITDA was higher in {higher_ebitda}: "
+                f"${eb_a:,.0f}M in {ya} vs ${eb_b:,.0f}M in {yb} "
+                f"(difference ~${diff:,.0f}M)."
+            )
+            unit = "$M"
+            reasoning = (
+                "Compare EBITDA values across the two columns, identify the larger year, "
+                "then subtract to approximate the spread."
+            )
+        else:
+            question = (
+                f"What is the direction of the debt-to-equity ratio for {company} from {ya} to {yb}?"
+            )
+            direction = "flat to slightly lower" if debt_eq_b <= debt_eq_a else "higher"
+            answer = (
+                f"Debt/equity moved from {debt_eq_a:.3f}x in {ya} to {debt_eq_b:.3f}x in {yb} "
+                f"— overall {direction} versus the prior year in this synthetic snapshot."
+            )
+            unit = "x"
+            reasoning = (
+                "Inspect the Debt / equity row and compare the two fiscal years numerically."
+            )
+
+        samples.append({
+            "id": str(uuid.uuid4()),
+            "task": "structured_analysis",
+            "instruction": "Analyze the following financial data and answer the question.",
+            "context": context,
+            "question": question,
+            "answer": answer,
+            "reasoning": reasoning,
+            "financial_data": financial_data,
+            "format": fmt,
+            "unit": unit,
+        })
+
+    logger.info("Generated %d structured_analysis samples.", len(samples))
     return samples
 
 
@@ -442,6 +566,26 @@ def deduplicate(samples: List[dict], threshold: int = 10) -> List[dict]:
     return unique
 
 
+def deduplicate_exact_question_answer(samples: List[dict]) -> List[dict]:
+    """
+    Drop exact duplicates on (question, answer) only. Template-heavy synthetic data
+    is often over-collapsed by SimHash; this keeps numerically distinct rows.
+    """
+    seen: Set[Tuple[str, str]] = set()
+    unique: List[dict] = []
+    for s in samples:
+        key = (s.get("question", "").strip().lower(), str(s.get("answer", "")).strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(s)
+    removed = len(samples) - len(unique)
+    logger.info(
+        "Exact-QA dedup: removed %d duplicate rows, kept %d samples.", removed, len(unique)
+    )
+    return unique
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main generation pipeline
 # ──────────────────────────────────────────────────────────────────────────────
@@ -450,6 +594,7 @@ def generate_all_synthetic_data(
     output_path: str = "data/raw/synthetic.jsonl",
     total_target: int = 5000,
     numerical_fraction: float = 0.30,
+    structured_analysis_fraction: float = 0.10,
     use_llm: bool = True,
     generator_model_id: str = "Qwen/Qwen2.5-7B-Instruct",
     seed: int = 42,
@@ -458,50 +603,141 @@ def generate_all_synthetic_data(
     Generate a full synthetic dataset and save to JSONL.
 
     Args:
-        output_path:         Where to write the JSONL file.
-        total_target:        Target number of samples after dedup/filtering.
-        numerical_fraction:  Fraction of samples that are numerical (Type B).
-        use_llm:             Whether to use the LLM generator for Type A samples.
-        generator_model_id:  Qwen2.5-7B model ID for LLM generation.
-        seed:                Random seed for reproducibility.
+        output_path:                  Where to write the JSONL file.
+        total_target:                 Target number of samples after assembly.
+        numerical_fraction:           Fraction of samples that are numerical (Type B).
+        structured_analysis_fraction: Fraction for Type C (structured_analysis).
+        use_llm:                      Whether to use the LLM generator for Type A samples.
+        generator_model_id:         Qwen2.5-7B model ID for LLM generation.
+        seed:                         Random seed for reproducibility.
 
     Returns:
         List of sample dicts.
     """
-    n_numerical = int(total_target * numerical_fraction)
-    n_llm = total_target - n_numerical
+    n_structured = int(round(total_target * structured_analysis_fraction))
+    n_numerical = int(round(total_target * numerical_fraction))
+    n_finqa = total_target - n_numerical - n_structured
+    if n_finqa < 0:
+        raise ValueError(
+            "numerical_fraction + structured_analysis_fraction must not exceed 1.0 "
+            f"(got {numerical_fraction} + {structured_analysis_fraction})."
+        )
 
-    logger.info("Generating %d numerical + %d LLM-based samples (target: %d after dedup).",
-                n_numerical, n_llm, total_target)
+    oversample = 5
+    logger.info(
+        "Target mix: %d financial_qa + %d numerical_reasoning + %d structured_analysis (= %d).",
+        n_finqa, n_numerical, n_structured, total_target,
+    )
 
-    numerical_samples = generate_numerical_samples(n=n_numerical * 2, seed=seed)
+    numerical_samples = generate_numerical_samples(n=max(n_numerical * oversample, 100), seed=seed)
+
+    structured_samples: List[dict] = []
+    try:
+        structured_samples = generate_structured_analysis_samples(
+            n=max(n_structured * oversample, 100), seed=seed
+        )
+    except Exception as exc:
+        print(
+            f"[structured_analysis] generation raised: {type(exc).__name__}: {exc}"
+        )
+        import traceback
+        traceback.print_exc()
 
     if use_llm:
         llm_samples = _generate_llm_samples(
-            n=n_llm * 2,
+            n=max(n_finqa * oversample, 100),
             generator_model_id=generator_model_id,
             seed=seed,
         )
     else:
-        # Fallback: generate template-based FinQA from contexts
-        llm_samples = _template_finqa_fallback(n=n_llm * 2, seed=seed)
+        llm_samples = _template_finqa_fallback(n=max(n_finqa * oversample, 100), seed=seed)
 
-    all_samples = numerical_samples + llm_samples
-    all_samples = [s for s in all_samples if _passes_quality_filter(
-        s.get("question", ""), str(s.get("answer", "")), s.get("context", "")
-    )]
-    all_samples = deduplicate(all_samples)
+    def _qf(s: dict) -> bool:
+        return _passes_quality_filter(
+            s.get("question", ""),
+            str(s.get("answer", "")),
+            s.get("context", ""),
+        )
 
-    # Trim to target
+    num_f = [s for s in numerical_samples if _qf(s)]
+    str_f = [s for s in structured_samples if _qf(s)]
+    fin_f = [s for s in llm_samples if _qf(s)]
+
+    print(
+        "After quality filter — "
+        f"numerical_reasoning: {len(num_f)}, structured_analysis: {len(str_f)}, "
+        f"financial_qa: {len(fin_f)} | "
+        f"{dict(Counter(s['task'] for s in num_f + str_f + fin_f))}"
+    )
+
+    num_d = deduplicate_exact_question_answer(num_f)
+    str_d = deduplicate_exact_question_answer(str_f)
+    fin_d = deduplicate_exact_question_answer(fin_f)
+
+    print(
+        "After dedup — "
+        f"numerical_reasoning: {len(num_d)}, structured_analysis: {len(str_d)}, "
+        f"financial_qa: {len(fin_d)} | "
+        f"{dict(Counter(s['task'] for s in num_d + str_d + fin_d))}"
+    )
+
     rng = random.Random(seed)
+    for pool in (num_d, str_d, fin_d):
+        rng.shuffle(pool)
+
+    num_take = num_d[:n_numerical]
+    str_take = str_d[:n_structured]
+    fin_take = fin_d[:n_finqa]
+    all_samples = num_take + str_take + fin_take
     rng.shuffle(all_samples)
-    all_samples = all_samples[:total_target]
+
+    task_counts = Counter(s["task"] for s in all_samples)
+    expected_tasks = {"financial_qa", "numerical_reasoning", "structured_analysis"}
+    missing = expected_tasks - set(task_counts.keys())
+
+    if missing:
+        raise RuntimeError(
+            f"Data generation produced 0 samples for task type(s): {sorted(missing)}. "
+            "Check the generator for that task type before continuing. "
+            f"Got: {dict(task_counts)}"
+        )
+
+    shortfall_pct = (total_target - len(all_samples)) / total_target
+    if shortfall_pct > 0.10:
+        raise RuntimeError(
+            f"Data generation shortfall: expected {total_target} samples, got {len(all_samples)} "
+            f"({shortfall_pct:.0%} short). Check generator logs above for errors."
+        )
+
+    if len(all_samples) != total_target:
+        raise RuntimeError(
+            f"Stratified assembly could not fill {total_target} samples (got {len(all_samples)}). "
+            f"Pool sizes after dedup: numerical={len(num_d)}, structured={len(str_d)}, "
+            f"financial_qa={len(fin_d)}; targets: {n_numerical}, {n_structured}, {n_finqa}."
+        )
+
+    print(f"Generation complete: {len(all_samples)} samples — {dict(task_counts)}")
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:
         for s in all_samples:
             f.write(json.dumps(s, default=str) + "\n")
+
+    written = 0
+    read_back_tasks: Counter = Counter()
+    with Path(output_path).open("r", encoding="utf-8") as rf:
+        for line in rf:
+            if not line.strip():
+                continue
+            written += 1
+            read_back_tasks[json.loads(line)["task"]] += 1
+    assert written == len(all_samples), (
+        f"Write verification failed: wrote {len(all_samples)} samples but "
+        f"file contains {written} lines. Possible disk/symlink issue."
+    )
+    print(f"Verified: {written} samples written to {output_path}")
+    print(f"After read-back — task mix from file: {dict(read_back_tasks)}")
 
     logger.info("Saved %d synthetic samples to %s", len(all_samples), output_path)
     return all_samples
@@ -591,15 +827,32 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate synthetic FinReasoning training data")
     parser.add_argument("--output", default="data/raw/synthetic.jsonl")
     parser.add_argument("--total", type=int, default=5000)
+    parser.add_argument("--numerical-fraction", type=float, default=0.30)
+    parser.add_argument("--structured-fraction", type=float, default=0.10)
     parser.add_argument("--no_llm", action="store_true",
                         help="Skip LLM generation (use template fallback only)")
     parser.add_argument("--generator", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--test-structured",
+        type=int,
+        metavar="N",
+        help="Generate N structured_analysis samples only, print JSON, and exit.",
+    )
     args = parser.parse_args()
+
+    if args.test_structured is not None:
+        print(f"--- Isolation test: {args.test_structured} structured_analysis samples ---\n")
+        for row in generate_structured_analysis_samples(n=args.test_structured, seed=args.seed):
+            print(json.dumps(row, indent=2, default=str))
+            print()
+        raise SystemExit(0)
 
     samples = generate_all_synthetic_data(
         output_path=args.output,
         total_target=args.total,
+        numerical_fraction=args.numerical_fraction,
+        structured_analysis_fraction=args.structured_fraction,
         use_llm=not args.no_llm,
         generator_model_id=args.generator,
         seed=args.seed,
