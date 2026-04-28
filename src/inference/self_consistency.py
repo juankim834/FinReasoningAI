@@ -39,9 +39,21 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _NUMBER_RE = re.compile(
-    r"-?\$?\s*(\d[\d,]*\.?\d*)\s*(%|billion|million|thousand|bps|x|M|B|K)?",
+    r"-?\$?\s*(\d[\d,]*\.?\d*)\s*(%|billion|million|thousand|trillion|bps|x|T|B|M|K)?",
     re.IGNORECASE,
 )
+
+# Word / letter suffix multipliers (case-insensitive) for _normalize_to_float
+_SCALE_SUFFIX: dict[str, float] = {
+    "k": 1e3,
+    "m": 1e6,
+    "b": 1e9,
+    "t": 1e12,
+    "thousand": 1e3,
+    "million": 1e6,
+    "billion": 1e9,
+    "trillion": 1e12,
+}
 
 
 def _extract_final_answer(text: str) -> str:
@@ -60,10 +72,25 @@ def _is_numerical(answer: str) -> bool:
     return bool(_NUMBER_RE.search(answer))
 
 
-def _parse_number(answer: str) -> Optional[float]:
-    """Parse the primary numeric value from an answer string."""
-    clean = answer.replace(",", "")
-    match = _NUMBER_RE.search(clean)
+def _normalize_to_float(s: str) -> Optional[float]:
+    """
+    Parse a single scalar from a free-form answer string.
+
+    Strips currency symbols, thousands separators, and percent signs, applies
+    K/M/B/T (and billion/million/thousand/trillion) suffix multipliers, and
+    returns ``None`` on failure so callers can exclude bad parses from aggregates.
+    """
+    s = _THINK_RE.sub("", s).strip()
+    if not s:
+        return None
+    s = s.replace(",", "").replace("$", "").strip()
+    if s.endswith("%"):
+        s = s[:-1].strip()
+        pct_mode = True
+    else:
+        pct_mode = False
+
+    match = _NUMBER_RE.search(s.replace(" ", ""))
     if not match:
         return None
     try:
@@ -71,27 +98,32 @@ def _parse_number(answer: str) -> Optional[float]:
     except ValueError:
         return None
     unit = (match.group(2) or "").lower()
-    scale = {"billion": 1e9, "b": 1e9, "million": 1e6, "m": 1e6, "thousand": 1e3, "k": 1e3}
-    if unit in scale:
-        v *= scale[unit]
-    elif unit == "%":
+    if unit in _SCALE_SUFFIX:
+        v *= _SCALE_SUFFIX[unit]
+    elif unit == "%" or pct_mode:
         v /= 100.0
     return v
 
 
+def _parse_number(answer: str) -> Optional[float]:
+    """Parse the primary numeric value from an answer string (alias for median path)."""
+    return _normalize_to_float(answer)
+
+
 def aggregate_numerical(answers: List[str]) -> str:
     """
-    Aggregate numerical answers via median.
-    Returns the original answer string closest to the median numeric value.
+    Aggregate numerical answers via median after ``_normalize_to_float`` on each
+    candidate so formats like ``$111.4 billion`` and ``111.4B`` map to the same
+    scale. If no value normalizes, falls back to majority vote on raw strings.
     """
     nums = []
     for a in answers:
-        n = _parse_number(a)
+        n = _normalize_to_float(a)
         if n is not None:
             nums.append((n, a))
 
     if not nums:
-        return answers[0] if answers else ""
+        return aggregate_categorical(answers) if answers else ""
 
     median_val = statistics.median(v for v, _ in nums)
 
@@ -143,11 +175,11 @@ def self_consistent_answer(
     if is_num:
         final = aggregate_numerical(cleaned)
         # Confidence: fraction of answers within 10% of the final numeric value
-        final_num = _parse_number(final)
+        final_num = _normalize_to_float(final)
         if final_num is not None and final_num != 0:
             agreeing = sum(
                 1 for a in cleaned
-                if (n := _parse_number(a)) is not None
+                if (n := _normalize_to_float(a)) is not None
                 and abs(n - final_num) / abs(final_num) <= 0.10
             )
             confidence = agreeing / len(cleaned)

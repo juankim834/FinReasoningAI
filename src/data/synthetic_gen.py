@@ -278,12 +278,9 @@ def _generate_llm_samples(
     [WARN] TRADE-OFF: Requires ~16 GB VRAM for the 7B generator (separate from the
     14B training model). Run generation on a separate machine or time-share the GPU.
     """
-    try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-    except ImportError as e:
-        logger.error("transformers not installed: %s", e)
-        return []
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
     if not torch.cuda.is_available():
         logger.warning(

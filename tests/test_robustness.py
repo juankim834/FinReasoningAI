@@ -28,6 +28,7 @@ import pytest
 from src.eval.evaluate import (
     compute_exact_match,
     compute_f1,
+    compute_f1_for_task,
     compute_grounding_rate,
     is_answer_parsable,
     _extract_number,
@@ -122,8 +123,8 @@ class TestExactMatch:
         assert compute_exact_match("$394.339 billion", "$394.3 billion") == 1.0
 
     def test_tolerance_exceeded(self):
-        # 394.3B vs 395.0B → relative error ≈ 0.18% → outside tolerance
-        assert compute_exact_match("$395.0 billion", "$394.3 billion") == 0.0
+        # Default fractional tolerance is 1%; use strict tol for a small gap case.
+        assert compute_exact_match("$395.0 billion", "$394.3 billion", tol=1e-4) == 0.0
 
     def test_text_exact_match(self):
         assert compute_exact_match("The operating margin improved", "The operating margin improved") == 1.0
@@ -188,8 +189,30 @@ class TestGroundingRate:
 
     def test_hallucinated_number(self, sample_financial_context):
         # $999 billion is NOT in the context
-        rate = compute_grounding_rate("$999 billion", sample_financial_context)
+        rate = compute_grounding_rate("$999 billion", sample_financial_context, task="financial_qa")
         assert rate == pytest.approx(0.0)
+
+    def test_numerical_grounding_matches_expression(self):
+        """Type B/C: grounding compares prediction to evaluated expression, not context literals."""
+        rate = compute_grounding_rate(
+            "1.0",
+            "this context string contains no matching numbers",
+            task="numerical_reasoning",
+            expression="0.5 + 0.5",
+            variables={},
+            numeric_tolerance=0.01,
+        )
+        assert rate == pytest.approx(1.0)
+
+        rate_bad = compute_grounding_rate(
+            "9.99",
+            "irrelevant",
+            task="numerical_reasoning",
+            expression="1 + 1",
+            variables={},
+            numeric_tolerance=0.01,
+        )
+        assert rate_bad == pytest.approx(0.0)
 
     def test_no_numbers_in_prediction(self, sample_financial_context):
         rate = compute_grounding_rate("Revenue increased year over year.", sample_financial_context)
@@ -362,12 +385,21 @@ def test_parsability_parametric(answer: str, expected_parsable: bool):
     assert is_answer_parsable(answer) == expected_parsable
 
 
-@pytest.mark.parametrize("pred,gt,expected_em", [
-    ("$394.3 billion", "$394.3 billion", 1.0),
-    ("$394.4 billion", "$394.3 billion", 0.0),   # >0.01% relative error
-    ("30.3%", "30.3%", 1.0),
-    ("not answerable", "$394.3 billion", 0.0),
+@pytest.mark.parametrize("pred,gt,expected_em,tol", [
+    ("$394.3 billion", "$394.3 billion", 1.0, None),
+    ("$394.4 billion", "$394.3 billion", 0.0, 1e-4),  # strict tol: ~0.025% error still fails 0.01%
+    ("30.3%", "30.3%", 1.0, None),
+    ("not answerable", "$394.3 billion", 0.0, None),
 ])
-def test_exact_match_parametric(pred: str, gt: str, expected_em: float):
-    result = compute_exact_match(pred, gt)
+def test_exact_match_parametric(pred: str, gt: str, expected_em: float, tol: Optional[float]):
+    kwargs = {} if tol is None else {"tol": tol}
+    result = compute_exact_match(pred, gt, **kwargs)
     assert result == pytest.approx(expected_em, abs=0.001)
+
+
+def test_f1_numeric_em_mode():
+    f1_ok, mode = compute_f1_for_task("numerical_reasoning", "2.0", "2.0", 1.0)
+    assert mode == "numeric_em"
+    assert f1_ok == 1.0
+    f1_bad, _ = compute_f1_for_task("numerical_reasoning", "3.0", "2.0", 0.0)
+    assert f1_bad == 0.0

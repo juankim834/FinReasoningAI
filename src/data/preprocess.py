@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -82,6 +83,7 @@ def format_financial_qa(sample: dict, include_reasoning: bool = True) -> str:
 
 def format_numerical_reasoning(sample: dict) -> str:
     """Format a Type B (numerical_reasoning) sample into ChatML."""
+    system = COT_SYSTEM_PROMPT if sample.get("_eval_use_cot") else SYSTEM_PROMPT
     var_lines = "\n".join(f"  {k} = {v:,.4f}" for k, v in sample["variables"].items())
     user_content = (
         f"{sample['instruction']}\n\n"
@@ -95,7 +97,7 @@ def format_numerical_reasoning(sample: dict) -> str:
         answer = f"{answer} {sample['unit']}"
 
     return (
-        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>system\n{system}<|im_end|>\n"
         f"<|im_start|>user\n{user_content}<|im_end|>\n"
         f"<|im_start|>assistant\n{answer}<|im_end|>"
     )
@@ -274,39 +276,71 @@ def stratified_split(
     seed: int = 42,
 ) -> Dict[str, List[dict]]:
     """
-    Stratified split by task type: 90% train / 5% val / 5% test.
-    Ensures each split has proportional representation of all task types.
+    Stratified split by task type: 90% train / 5% val / 5% test (defaults).
+
+    Uses ``sklearn.model_selection.train_test_split`` with ``stratify`` on task
+    labels so the global train/val/test partition preserves task-type proportions
+    (unlike independent per-task random splits that can skew small slices).
     """
-    import random
+    from sklearn.model_selection import train_test_split
 
-    rng = random.Random(seed)
+    if not samples:
+        return {"train": [], "val": [], "test": []}
 
-    # Group by task
-    by_task: Dict[str, List[dict]] = {}
-    for s in samples:
-        t = s.get("task", "financial_qa")
-        by_task.setdefault(t, []).append(s)
-
-    splits: Dict[str, List[dict]] = {"train": [], "val": [], "test": []}
-
-    for task, task_samples in by_task.items():
-        rng.shuffle(task_samples)
-        n = len(task_samples)
-        n_train = int(n * train_frac)
-        n_val = int(n * val_frac)
-
-        splits["train"].extend(task_samples[:n_train])
-        splits["val"].extend(task_samples[n_train : n_train + n_val])
-        splits["test"].extend(task_samples[n_train + n_val :])
-
-        logger.info(
-            "Task %-22s — train: %4d, val: %3d, test: %3d",
-            task, n_train, n_val, n - n_train - n_val,
+    if train_frac + val_frac >= 1.0:
+        raise ValueError(
+            f"train_frac ({train_frac}) + val_frac ({val_frac}) must be < 1.0 "
+            "so a non-empty test split exists."
         )
 
-    # Final shuffle within each split
-    for key in splits:
-        rng.shuffle(splits[key])
+    labels = [s.get("task", "financial_qa") for s in samples]
+    test_size = 1.0 - train_frac - val_frac
+    idx = list(range(len(samples)))
+
+    train_val_idx, test_idx = train_test_split(
+        idx,
+        test_size=test_size,
+        random_state=seed,
+        stratify=labels,
+    )
+
+    train_val_labels = [labels[i] for i in train_val_idx]
+    val_size = val_frac / (train_frac + val_frac)
+
+    train_rel_idx, val_rel_idx = train_test_split(
+        list(range(len(train_val_idx))),
+        test_size=val_size,
+        random_state=seed,
+        stratify=train_val_labels,
+    )
+
+    train_idx = [train_val_idx[i] for i in train_rel_idx]
+    val_idx = [train_val_idx[i] for i in val_rel_idx]
+    test_idx_final = test_idx
+
+    train = [samples[i] for i in train_idx]
+    val = [samples[i] for i in val_idx]
+    test = [samples[i] for i in test_idx_final]
+
+    splits = {"train": train, "val": val, "test": test}
+
+    _EXPECTED_TASK_TYPES = frozenset(
+        {"financial_qa", "numerical_reasoning", "structured_analysis"}
+    )
+    test_tasks = {s.get("task", "financial_qa") for s in test}
+    missing = _EXPECTED_TASK_TYPES - test_tasks
+    if missing:
+        raise ValueError(
+            "Stratified test split is missing at least one task type: "
+            f"{sorted(missing)}. The dataset may be too small for the chosen "
+            f"train_frac={train_frac}, val_frac={val_frac} (test fraction "
+            f"={test_size:.3f}) while preserving all labels in every split. "
+            "Try more raw samples, a larger test fraction, or merge task-specific files."
+        )
+
+    for split_name, rows in splits.items():
+        c = Counter(s.get("task", "financial_qa") for s in rows)
+        logger.info("Split %-6s | n=%5d | by task: %s", split_name, len(rows), dict(c))
 
     return splits
 
