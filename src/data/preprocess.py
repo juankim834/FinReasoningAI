@@ -281,6 +281,10 @@ def stratified_split(
     Uses ``sklearn.model_selection.train_test_split`` with ``stratify`` on task
     labels so the global train/val/test partition preserves task-type proportions
     (unlike independent per-task random splits that can skew small slices).
+
+    After splitting, verifies that every task label present in ``samples`` also
+    appears in ``test`` at least once. Task types that do not occur in the raw
+    corpus are not required in the test set.
     """
     from sklearn.model_selection import train_test_split
 
@@ -324,18 +328,18 @@ def stratified_split(
 
     splits = {"train": train, "val": val, "test": test}
 
-    _EXPECTED_TASK_TYPES = frozenset(
-        {"financial_qa", "numerical_reasoning", "structured_analysis"}
-    )
+    # Require every task label that exists in the corpus to appear at least once
+    # in the test split — do not require task types that are absent from raw data.
+    tasks_in_corpus = {s.get("task", "financial_qa") for s in samples}
     test_tasks = {s.get("task", "financial_qa") for s in test}
-    missing = _EXPECTED_TASK_TYPES - test_tasks
-    if missing:
+    missing_in_test = tasks_in_corpus - test_tasks
+    if missing_in_test:
         raise ValueError(
-            "Stratified test split is missing at least one task type: "
-            f"{sorted(missing)}. The dataset may be too small for the chosen "
-            f"train_frac={train_frac}, val_frac={val_frac} (test fraction "
-            f"={test_size:.3f}) while preserving all labels in every split. "
-            "Try more raw samples, a larger test fraction, or merge task-specific files."
+            "Stratified test split has no examples for task type(s) "
+            f"{sorted(missing_in_test)} even though they appear in the raw data. "
+            f"This usually means too few rows per label for train_frac={train_frac}, "
+            f"val_frac={val_frac} (test fraction={test_size:.3f}). "
+            "Try more samples per task, increase the test fraction, or adjust the seed."
         )
 
     for split_name, rows in splits.items():
