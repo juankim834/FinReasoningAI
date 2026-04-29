@@ -1,0 +1,39 @@
+# --- Python 字节码与缓存 ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.cache/
+
+venv/
+.venv/
+env/
+bin/
+lib/
+include/
+
+.env
+.flaskenv
+*.local
+
+# data/
+# models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.pkl
+*.csv
+*.parquet
+
+
+dist/
+build/
+*.egg-info/
+.installed.cfg
+
+
+.vscode/
+.idea/
+.DS_Store
