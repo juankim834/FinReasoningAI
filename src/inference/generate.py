@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ast
 from importlib import import_module
+import json
 import logging
 import math
 import operator
@@ -71,7 +72,8 @@ TOOL_SYSTEM_PROMPT = (
 
 # Pattern to detect and strip leaked think tags from output
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-_TOOL_CALL_RE = re.compile(r"<tool_call>calculate\((.+?)\)</tool_call>", re.DOTALL)
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_LEGACY_CALC_RE = re.compile(r"^calculate\((.+)\)$", re.DOTALL)
 _NUMBER_RE = re.compile(
     r"-?\$?\s*(\d[\d,]*\.?\d*)\s*(%|billion|million|thousand|bps|x|M|B|K)?",
     re.IGNORECASE,
@@ -85,6 +87,11 @@ _REFUSAL_RE = re.compile(
 )
 
 INSUFFICIENT_INFO_RESPONSE = "Insufficient information."
+
+try:
+    from tools.financial_tools import TOOL_REGISTRY as _FIN_TOOL_REGISTRY
+except Exception:
+    _FIN_TOOL_REGISTRY = {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -383,17 +390,41 @@ def safe_calculate(expression: str) -> Union[float, str]:
 
 def _execute_tool_calls(text: str) -> str:
     """
-    Find all <tool_call>calculate(...)</tool_call> tags in text,
-    evaluate the expression, and inject the result back.
+    Find all <tool_call>...</tool_call> tags in text, execute supported
+    tool payloads, and inject results back as <tool_result>...</tool_result>.
+
+    Supported formats:
+      1) Legacy: calculate(expression)
+      2) JSON: {"tool": "...", "input": {...}}
     """
     def replace_tool_call(match: re.Match) -> str:
-        expr = match.group(1).strip()
-        result = safe_calculate(expr)
-        if isinstance(result, float):
-            formatted = f"{result:,.6g}"
-        else:
-            formatted = str(result)
-        return f"<tool_result>{formatted}</tool_result>"
+        payload = match.group(1).strip()
+
+        # Legacy format: calculate(expression)
+        legacy = _LEGACY_CALC_RE.match(payload)
+        if legacy:
+            expr = legacy.group(1).strip()
+            result = safe_calculate(expr)
+            if isinstance(result, float):
+                formatted = f"{result:,.6g}"
+            else:
+                formatted = str(result)
+            return f"<tool_result>{formatted}</tool_result>"
+
+        # JSON format: {"tool": "...", "input": {...}}
+        try:
+            obj = json.loads(payload)
+            tool_name = obj.get("tool")
+            tool_input = obj.get("input", {})
+
+            if tool_name in _FIN_TOOL_REGISTRY:
+                tool_result = _FIN_TOOL_REGISTRY[tool_name](**tool_input)
+            else:
+                tool_result = {"error": f"Unknown tool: {tool_name}"}
+        except Exception as exc:
+            tool_result = {"error": f"Tool parse/exec failure: {exc}"}
+
+        return f"<tool_result>{json.dumps(tool_result, ensure_ascii=False)}</tool_result>"
 
     return _TOOL_CALL_RE.sub(replace_tool_call, text)
 

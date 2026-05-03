@@ -19,7 +19,7 @@ Agent prompt template:
   The model is given a system prompt explaining the tool interface and a
   growing transcript of Thought/Action/Observation turns.
 
-[WARN] TRADE-OFF: ReAct adds latency proportional to N steps × generation time.
+[WARN] TRADE-OFF: ReAct adds latency proportional to N steps x generation time.
 For a 14B model at 4-bit, each step ≈ 1–2 seconds on A100.
 5 steps → ~5–10 seconds total. For sub-second latency, disable ReAct and
 use direct generation with pre-retrieved context instead.
