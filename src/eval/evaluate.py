@@ -24,6 +24,7 @@ import re
 import string
 from collections import Counter
 from copy import deepcopy
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -387,6 +388,19 @@ def generate_prediction(
         )
         return final.strip()
 
+    from src.inference.generate import _is_vllm_model, _vllm_generate_texts
+
+    if _is_vllm_model(model):
+        raw_outputs = _vllm_generate_texts(
+            model=model,
+            prompts=[prompt],
+            temperature=max(temperature, 0.0) if do_sample or temperature > 0 else 0.0,
+            top_p=0.9,
+            max_new_tokens=max_new_tokens,
+            n=1,
+        )
+        return raw_outputs[0][0].strip() if raw_outputs and raw_outputs[0] else ""
+
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
@@ -724,15 +738,27 @@ if __name__ == "__main__":
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--numeric_tolerance", type=float, default=0.01)
     parser.add_argument("--run_baseline", action="store_true")
+    parser.add_argument("--engine", choices=["vllm", "transformers"], default="vllm")
     args = parser.parse_args()
 
-    from src.model.load_model import load_model_and_tokenizer, DEFAULT_BNB_CONFIG
     from datasets import load_from_disk
 
-    model, tokenizer = load_model_and_tokenizer(args.model_id)
+    if args.engine == "vllm":
+        from src.model.load_model import load_vllm_model_and_tokenizer
 
-    if args.adapter_dir != "none" and Path(args.adapter_dir).exists():
-        from peft import PeftModel
+        model, tokenizer = load_vllm_model_and_tokenizer(args.model_id)
+        if args.adapter_dir != "none":
+            logger.warning(
+                "vLLM evaluation expects a merged model path. Ignoring --adapter_dir=%s.",
+                args.adapter_dir,
+            )
+    else:
+        from src.model.load_model import load_model_and_tokenizer
+
+        model, tokenizer = load_model_and_tokenizer(args.model_id)
+
+    if args.engine == "transformers" and args.adapter_dir != "none" and Path(args.adapter_dir).exists():
+        PeftModel = import_module("peft").PeftModel
         model = PeftModel.from_pretrained(model, args.adapter_dir)
         logger.info("Loaded adapter from %s", args.adapter_dir)
 

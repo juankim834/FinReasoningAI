@@ -30,11 +30,12 @@ Tool use (Step 6d):
 from __future__ import annotations
 
 import ast
+from importlib import import_module
 import logging
 import math
 import operator
 import re
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Union
 
 import torch
 from transformers import LogitsProcessor, LogitsProcessorList, PreTrainedTokenizerBase
@@ -190,6 +191,87 @@ class NumericBiasLogitsProcessor(LogitsProcessor):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# vLLM generation adapter
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _is_vllm_model(model: Any) -> bool:
+    """Return True when ``model`` is a vLLM LLM engine rather than HF Transformers."""
+    return (
+        model.__class__.__module__.startswith("vllm")
+        or hasattr(model, "llm_engine")
+        or hasattr(model, "engine_class")
+    )
+
+
+def _build_vllm_sampling_params(
+    *,
+    temperature: float,
+    top_p: float,
+    max_new_tokens: int,
+    num_beams: int = 1,
+    n: int = 1,
+) -> Any:
+    """Create SamplingParams while staying compatible across vLLM versions."""
+    from inspect import signature
+
+    SamplingParams = import_module("vllm").SamplingParams
+
+    sig = signature(SamplingParams)
+    supported = set(sig.parameters)
+
+    params: dict[str, Any] = {
+        "n": n,
+        "temperature": temperature,
+        "top_p": top_p if temperature > 0.0 else 1.0,
+        "max_tokens": max_new_tokens,
+        "stop": ["<|im_end|>", "<|endoftext|>"],
+    }
+
+    if num_beams > 1:
+        if "use_beam_search" in supported:
+            params["use_beam_search"] = True
+            params["best_of"] = num_beams
+            params["temperature"] = 0.0
+            params["top_p"] = 1.0
+        else:
+            logger.warning(
+                "num_beams=%d requested, but this vLLM version does not expose "
+                "beam search in SamplingParams. Falling back to greedy decoding.",
+                num_beams,
+            )
+
+    # Older/newer vLLM releases differ slightly; pass only accepted parameters.
+    return SamplingParams(**{k: v for k, v in params.items() if k in supported})
+
+
+def _vllm_generate_texts(
+    model: Any,
+    prompts: List[str],
+    *,
+    temperature: float = 0.0,
+    top_p: float = 0.9,
+    max_new_tokens: int = 256,
+    num_beams: int = 1,
+    n: int = 1,
+) -> List[List[str]]:
+    """
+    Generate completions with vLLM.
+
+    Returns one list of completions per prompt. The public inference functions
+    keep the same post-processing and validation logic regardless of backend.
+    """
+    sampling_params = _build_vllm_sampling_params(
+        temperature=temperature,
+        top_p=top_p,
+        max_new_tokens=max_new_tokens,
+        num_beams=num_beams,
+        n=n,
+    )
+    outputs = model.generate(prompts, sampling_params)
+    return [[completion.text for completion in request_output.outputs] for request_output in outputs]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Post-processing
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -322,7 +404,7 @@ def _execute_tool_calls(text: str) -> str:
 
 def generate_answer(
     model,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: Optional[PreTrainedTokenizerBase],
     question: str,
     context: str = "",
     instruction: str = "",
@@ -341,8 +423,8 @@ def generate_answer(
     Generate a financial answer for the given question + context.
 
     Args:
-        model:              Fine-tuned model (4-bit QLoRA or merged).
-        tokenizer:          Matching tokenizer.
+        model:              Fine-tuned model, or a vLLM LLM engine.
+        tokenizer:          Matching tokenizer. Optional for vLLM.
         question:           The question to answer.
         context:            Source document passage (10-K, earnings transcript, etc.)
         instruction:        Optional override instruction string.
@@ -388,15 +470,30 @@ def generate_answer(
 
     # --- Self-consistency path ---
     if self_consistency_n > 1:
-        from src.inference.self_consistency import sample_with_self_consistency
-        final, confidence, _ = sample_with_self_consistency(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            n=self_consistency_n,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-        )
+        if _is_vllm_model(model):
+            from src.inference.self_consistency import self_consistent_answer
+
+            raw_answers = _vllm_generate_texts(
+                model=model,
+                prompts=[prompt],
+                temperature=temperature,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+                n=self_consistency_n,
+            )[0]
+            final, confidence = self_consistent_answer(raw_answers)
+        else:
+            if tokenizer is None:
+                raise ValueError("tokenizer is required for Transformers generation.")
+            from src.inference.self_consistency import sample_with_self_consistency
+            final, confidence, _ = sample_with_self_consistency(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                n=self_consistency_n,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+            )
         if confidence < min_confidence:
             logger.warning(
                 "Self-consistency confidence %.2f < threshold %.2f. "
@@ -411,46 +508,63 @@ def generate_answer(
         return final
 
     # --- Single generation path ---
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1900,
-        padding=False,
-    ).to(model.device)
-
-    do_sample = temperature > 0.0
-
-    logits_processors = LogitsProcessorList()
-    numeric_processor: Optional[NumericBiasLogitsProcessor] = None
-    if use_numeric_bias:
-        numeric_processor = NumericBiasLogitsProcessor(tokenizer)
-        # Heuristic activation: activate if question implies a numeric answer
-        numeric_keywords = re.compile(
-            r"\b(how much|how many|what (is|was|were) the|calculate|compute|"
-            r"total|revenue|profit|margin|ratio|growth|return|percentage|rate)\b",
-            re.IGNORECASE,
-        )
-        if numeric_keywords.search(question):
-            numeric_processor.activate()
-            logits_processors.append(numeric_processor)
-
-    model.eval()
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
+    if _is_vllm_model(model):
+        if use_numeric_bias:
+            logger.warning("use_numeric_bias is not supported by vLLM; continuing without it.")
+        if num_beams > 1 and temperature > 0.0:
+            num_beams = 1
+        raw_output = _vllm_generate_texts(
+            model=model,
+            prompts=[prompt],
+            temperature=temperature,
+            top_p=top_p,
             max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature if do_sample else None,
-            top_p=top_p if do_sample else None,
             num_beams=num_beams,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            logits_processor=logits_processors if logits_processors else None,
-        )
+            n=1,
+        )[0][0]
+    else:
+        if tokenizer is None:
+            raise ValueError("tokenizer is required for Transformers generation.")
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1900,
+            padding=False,
+        ).to(model.device)
 
-    new_ids = output_ids[0, inputs["input_ids"].shape[1]:]
-    raw_output = tokenizer.decode(new_ids, skip_special_tokens=True)
+        do_sample = temperature > 0.0
+
+        logits_processors = LogitsProcessorList()
+        numeric_processor: Optional[NumericBiasLogitsProcessor] = None
+        if use_numeric_bias:
+            numeric_processor = NumericBiasLogitsProcessor(tokenizer)
+            # Heuristic activation: activate if question implies a numeric answer
+            numeric_keywords = re.compile(
+                r"\b(how much|how many|what (is|was|were) the|calculate|compute|"
+                r"total|revenue|profit|margin|ratio|growth|return|percentage|rate)\b",
+                re.IGNORECASE,
+            )
+            if numeric_keywords.search(question):
+                numeric_processor.activate()
+                logits_processors.append(numeric_processor)
+
+        model.eval()
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
+                top_p=top_p if do_sample else None,
+                num_beams=num_beams,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                logits_processor=logits_processors if logits_processors else None,
+            )
+
+        new_ids = output_ids[0, inputs["input_ids"].shape[1]:]
+        raw_output = tokenizer.decode(new_ids, skip_special_tokens=True)
 
     # --- Tool use: execute any calculator calls ---
     if use_tools and "<tool_call>" in raw_output:
@@ -485,7 +599,7 @@ def generate_answer(
 
 def batch_generate(
     model,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: Optional[PreTrainedTokenizerBase],
     samples: List[dict],
     use_cot: bool = False,
     max_new_tokens: int = 256,
@@ -508,27 +622,42 @@ def batch_generate(
             for s in batch
         ]
 
-        inputs = tokenizer(
-            prompts,
-            return_tensors="pt",
-            truncation=True,
-            max_length=1900,
-            padding=True,
-            pad_to_multiple_of=8,
-        ).to(model.device)
-
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
+        if _is_vllm_model(model):
+            batch_outputs = _vllm_generate_texts(
+                model=model,
+                prompts=prompts,
+                temperature=0.0,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+                n=1,
             )
+            raw_outputs = [outputs[0] if outputs else "" for outputs in batch_outputs]
+        else:
+            if tokenizer is None:
+                raise ValueError("tokenizer is required for Transformers generation.")
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                truncation=True,
+                max_length=1900,
+                padding=True,
+                pad_to_multiple_of=8,
+            ).to(model.device)
 
-        for j, (sample, out_ids) in enumerate(zip(batch, output_ids)):
-            prompt_len = inputs["input_ids"][j].shape[0]
-            new_ids = out_ids[prompt_len:]
-            raw = tokenizer.decode(new_ids, skip_special_tokens=True)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+
+            raw_outputs = []
+            for j, out_ids in enumerate(output_ids):
+                prompt_len = inputs["input_ids"][j].shape[0]
+                new_ids = out_ids[prompt_len:]
+                raw_outputs.append(tokenizer.decode(new_ids, skip_special_tokens=True))
+
+        for raw in raw_outputs:
             if use_cot:
                 answers.append(extract_answer_from_cot_output(raw))
             else:
@@ -562,16 +691,28 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--engine", choices=["vllm", "transformers"], default="vllm")
     args = parser.parse_args()
 
-    from src.model.load_model import load_model_and_tokenizer
+    if args.engine == "vllm":
+        from src.model.load_model import load_vllm_model_and_tokenizer
 
-    model, tokenizer = load_model_and_tokenizer(args.model_id)
+        model, tokenizer = load_vllm_model_and_tokenizer(args.model_id)
+        if args.adapter_dir != "none":
+            logger.warning(
+                "vLLM expects a merged model path for adapter weights in this CLI. "
+                "Ignoring --adapter_dir=%s; run merge_adapter.ipynb first.",
+                args.adapter_dir,
+            )
+    else:
+        from src.model.load_model import load_model_and_tokenizer
 
-    if args.adapter_dir != "none":
+        model, tokenizer = load_model_and_tokenizer(args.model_id)
+
+    if args.engine == "transformers" and args.adapter_dir != "none":
         from pathlib import Path
         if Path(args.adapter_dir).exists():
-            from peft import PeftModel
+            PeftModel = import_module("peft").PeftModel
             model = PeftModel.from_pretrained(model, args.adapter_dir)
 
     answer = generate_answer(

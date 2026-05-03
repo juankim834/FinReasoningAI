@@ -370,28 +370,40 @@ def react_agent(
         )
 
         # Generate next step
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=3800,
-        ).to(model.device)
+        from src.inference.generate import _is_vllm_model, _vllm_generate_texts
 
-        import torch
-        model.eval()
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
+        if _is_vllm_model(model):
+            outputs = _vllm_generate_texts(
+                model=model,
+                prompts=[prompt],
+                temperature=temperature,
                 max_new_tokens=max_new_tokens_per_step,
-                do_sample=temperature > 0.0,
-                temperature=temperature if temperature > 0.0 else None,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                # Stop at newline after Answer: to avoid over-generation
+                n=1,
             )
+            step_output = outputs[0][0].strip() if outputs and outputs[0] else ""
+        else:
+            inputs = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=3800,
+            ).to(model.device)
 
-        new_ids = output_ids[0, inputs["input_ids"].shape[1]:]
-        step_output = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            import torch
+            model.eval()
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens_per_step,
+                    do_sample=temperature > 0.0,
+                    temperature=temperature if temperature > 0.0 else None,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    # Stop at newline after Answer: to avoid over-generation
+                )
+
+            new_ids = output_ids[0, inputs["input_ids"].shape[1]:]
+            step_output = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
         logger.debug("Step %d output: %s", step + 1, step_output[:200])
 

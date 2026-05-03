@@ -223,6 +223,29 @@ def sample_with_self_consistency(
     Memory: each generation holds one beam in memory; N sequential generations
     peak at ~2× inference VRAM = ~24 GB for Qwen2.5-14B at 4-bit. [OK]
     """
+    from src.inference.generate import _is_vllm_model, _vllm_generate_texts
+
+    if _is_vllm_model(model):
+        raw_answers = _vllm_generate_texts(
+            model=model,
+            prompts=[prompt],
+            temperature=temperature,
+            top_p=0.9,
+            max_new_tokens=max_new_tokens,
+            n=n,
+        )[0]
+        for i, answer in enumerate(raw_answers):
+            logger.debug("Sample %d/%d: %s", i + 1, n, answer[:80])
+
+        final, confidence = self_consistent_answer(raw_answers)
+        if confidence < min_confidence:
+            logger.warning(
+                "Low self-consistency confidence (%.2f < %.2f). "
+                "Consider returning 'Insufficient information' for this query.",
+                confidence, min_confidence,
+            )
+        return final, confidence, raw_answers
+
     inputs = tokenizer(
         prompt,
         return_tensors="pt",

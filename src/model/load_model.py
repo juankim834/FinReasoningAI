@@ -25,8 +25,9 @@ VRAM estimates (rough):
 
 from __future__ import annotations
 
+from importlib import import_module
 import logging
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 from transformers import (
@@ -186,6 +187,54 @@ def load_model_and_tokenizer(
 def get_default_bnb_config() -> BitsAndBytesConfig:
     """Return the default 4-bit NF4 double-quantization config."""
     return DEFAULT_BNB_CONFIG
+
+
+def load_vllm_model_and_tokenizer(
+    model_id: str = DEFAULT_MODEL_ID,
+    *,
+    tensor_parallel_size: int = 1,
+    dtype: str = "bfloat16",
+    trust_remote_code: bool = True,
+    max_model_len: int = 2048,
+    gpu_memory_utilization: float = 0.90,
+    enable_lora: bool = False,
+    **llm_kwargs: Any,
+) -> Tuple[Any, PreTrainedTokenizerBase]:
+    """
+    Load the inference model through vLLM.
+
+    This is intended for merged checkpoints or base models. For LoRA adapters,
+    either merge the adapter first or pass vLLM-specific LoRA settings via
+    ``llm_kwargs`` and the downstream serving layer.
+    """
+    _check_vram(required_gb=10.0)
+
+    logger.info("Loading tokenizer from %s", model_id)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        trust_remote_code=trust_remote_code,
+        padding_side="left",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.info("pad_token set to eos_token: %s", tokenizer.eos_token)
+
+    logger.info("Loading vLLM engine from %s", model_id)
+    LLM = import_module("vllm").LLM
+
+    model = LLM(
+        model=model_id,
+        tokenizer=model_id,
+        tensor_parallel_size=tensor_parallel_size,
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enable_lora=enable_lora,
+        **llm_kwargs,
+    )
+
+    return model, tokenizer
 
 
 # ──────────────────────────────────────────────────────────────────────────────
