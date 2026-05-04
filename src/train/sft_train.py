@@ -231,6 +231,7 @@ def main(
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
             callbacks=callbacks,
         )
     else:
@@ -241,6 +242,7 @@ def main(
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
             data_collator=_build_old_trl_collator(tokenizer),
             callbacks=callbacks,
             max_seq_length=max_seq_length,
