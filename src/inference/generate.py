@@ -30,9 +30,18 @@ COT_SYSTEM_PROMPT = (
 )
 
 _TOOL_PROMPT_INTRO = (
-    "You may call available tools when a computation would improve accuracy. "
-    "When you want to use one, emit exactly one JSON payload inside <tool_call>...</tool_call> "
-    'using the shape {"name": <tool_name>, "arguments": {...}}.'
+    "You have access to calculation tools. "
+    "For EVERY numeric computation — subtraction, division, multiplication, "
+    "percentage change, ratio, or growth rate — you MUST call a tool. "
+    "Do NOT compute numbers in your head.\n\n"
+    "To call a tool emit exactly ONE JSON block inside tags (one call per turn):\n"
+    '  <tool_call>{"name": "<tool_name>", "arguments": {...}}</tool_call>\n\n'
+    "Available tools:\n"
+    "  • arithmetic(a, b, operation)  — add | subtract | multiply | divide | percent_change\n"
+    "  • calculate_financial_ratio(numerator, denominator, ratio_name)\n"
+    "  • parse_percentage(value_str)  — normalize a percentage string to a decimal\n"
+    "  • compound_growth_rate(start_value, end_value, n_periods)  — CAGR\n\n"
+    "After all tool calls are done, write your final answer on a line starting with 'Answer:'."
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -379,12 +388,9 @@ def generate_with_tools(
         })
         messages.append({"role": "assistant", "content": raw_output})
         messages.append({
-            "role": "user",
-            "content": (
-                f"Tool result for {parsed_call['name']}: "
-                f"{json.dumps(tool_result, ensure_ascii=False)}\n"
-                "Use this result to produce your final answer."
-            ),
+            "role": "tool",
+            "name": parsed_call["name"],
+            "content": json.dumps(tool_result, ensure_ascii=False),
         })
 
     answer = extract_answer_from_cot_output(full_output)

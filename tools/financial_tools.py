@@ -10,6 +10,32 @@ FINANCIAL_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "arithmetic",
+            "description": (
+                "Perform basic arithmetic on two numbers. "
+                "Use this for any addition, subtraction, multiplication, division, "
+                "or percentage-change computation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "number", "description": "First operand"},
+                    "b": {"type": "number", "description": "Second operand"},
+                    "operation": {
+                        "type": "string",
+                        "description": (
+                            "One of: add | subtract | multiply | divide | percent_change. "
+                            "percent_change computes (a - b) / |b|."
+                        ),
+                    },
+                },
+                "required": ["a", "b", "operation"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calculate_financial_ratio",
             "description": "Compute a standard financial ratio from two numeric values.",
             "parameters": {
@@ -54,6 +80,39 @@ FINANCIAL_TOOLS = [
         },
     },
 ]
+
+
+def arithmetic(a: float, b: float, operation: str) -> dict[str, Any]:
+    """Perform basic arithmetic: add, subtract, multiply, divide, or percent_change."""
+    a, b = float(a), float(b)
+    op = operation.lower().strip()
+    if op in ("add", "+"):
+        result = a + b
+        expr = f"{a} + {b}"
+    elif op in ("subtract", "sub", "-"):
+        result = a - b
+        expr = f"{a} - {b}"
+    elif op in ("multiply", "mul", "*"):
+        result = a * b
+        expr = f"{a} * {b}"
+    elif op in ("divide", "div", "/"):
+        if b == 0:
+            return {"error": "Division by zero."}
+        result = a / b
+        expr = f"{a} / {b}"
+    elif op in ("percent_change", "pct_change", "pct_chg", "%_change"):
+        if b == 0:
+            return {"error": "Base value b cannot be zero for percent_change."}
+        result = (a - b) / abs(b)
+        expr = f"({a} - {b}) / |{b}|"
+    else:
+        return {
+            "error": (
+                f"Unknown operation '{operation}'. "
+                "Use: add, subtract, multiply, divide, or percent_change."
+            )
+        }
+    return {"result": result, "explanation": f"Computed {expr} = {result:.6f}."}
 
 
 def calculate_financial_ratio(numerator: float, denominator: float, ratio_name: str) -> dict[str, Any]:
@@ -103,6 +162,7 @@ def compound_growth_rate(start_value: float, end_value: float, n_periods: float)
 
 
 TOOL_REGISTRY = {
+    "arithmetic": arithmetic,
     "calculate_financial_ratio": calculate_financial_ratio,
     "parse_percentage": parse_percentage,
     "compound_growth_rate": compound_growth_rate,
@@ -111,6 +171,7 @@ TOOL_REGISTRY = {
 __all__ = [
     "FINANCIAL_TOOLS",
     "TOOL_REGISTRY",
+    "arithmetic",
     "calculate_financial_ratio",
     "parse_percentage",
     "compound_growth_rate",
