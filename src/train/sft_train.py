@@ -227,9 +227,11 @@ def main(
         raise EnvironmentError("No CUDA GPU detected. QLoRA training requires a GPU.")
 
     from src.model.apply_lora import apply_qlora
-    from src.model.load_model import DEFAULT_BNB_CONFIG, load_model_and_tokenizer
+    from src.model.load_model import get_default_bnb_config, get_preferred_torch_dtype, load_model_and_tokenizer
 
-    model, tokenizer = load_model_and_tokenizer(model_id=model_id, bnb_config=DEFAULT_BNB_CONFIG)
+    preferred_dtype = get_preferred_torch_dtype()
+    logger.info("Preferred training dtype: %s", preferred_dtype)
+    model, tokenizer = load_model_and_tokenizer(model_id=model_id, bnb_config=get_default_bnb_config())
     lora_config = build_lora_config(
         lora_r=lora_r,
         lora_alpha=lora_alpha,
