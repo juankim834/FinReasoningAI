@@ -85,7 +85,8 @@ def enable_safe_bf16_causal_mask_patch() -> bool:
         if sliding_window is not None:
             diagonal = past_key_values_length - sliding_window - 1
             context_mask = torch.tril(torch.ones_like(mask, dtype=torch.bool), diagonal=diagonal)
-            if mask_utils.is_torchdynamo_compiling():
+            is_torchdynamo_compiling = getattr(mask_utils, "is_torchdynamo_compiling", None)
+            if callable(is_torchdynamo_compiling) and is_torchdynamo_compiling():
                 mask = mask.clone()
             mask.masked_fill_(context_mask, mask_value)
 
