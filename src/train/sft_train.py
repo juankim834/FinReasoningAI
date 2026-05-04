@@ -12,7 +12,7 @@ from typing import Any, Optional
 import torch
 from datasets import DatasetDict, load_from_disk
 from peft import LoraConfig, TaskType
-from transformers import AutoTokenizer, EarlyStoppingCallback
+from transformers import AutoTokenizer, EarlyStoppingCallback, Trainer
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,31 @@ def _prepare_old_trl_dataset(dataset: Any) -> Any:
     )
 
 
+def _tokenize_old_trl_dataset(dataset: Any, tokenizer: AutoTokenizer, max_seq_length: int) -> Any:
+    """
+    Tokenize text examples for the legacy TRL/Trainer path.
+
+    This avoids relying on old SFTTrainer preprocessing behavior, which can leave
+    raw string fields in the collator path and trigger tensor conversion errors.
+    """
+    text_dataset = _prepare_old_trl_dataset(dataset)
+
+    def tokenize_batch(batch: dict[str, Any]) -> dict[str, Any]:
+        return tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=max_seq_length,
+            padding=False,
+            return_special_tokens_mask=True,
+        )
+
+    return text_dataset.map(
+        tokenize_batch,
+        batched=True,
+        remove_columns=text_dataset.column_names,
+    )
+
+
 
 def main(
     model_id: str = DEFAULT_MODEL_ID,
@@ -235,19 +260,19 @@ def main(
             callbacks=callbacks,
         )
     else:
-        train_dataset = _prepare_old_trl_dataset(train_dataset)
-        eval_dataset = _prepare_old_trl_dataset(eval_dataset) if eval_dataset is not None else None
-        trainer = SFTTrainer(
+        train_dataset = _tokenize_old_trl_dataset(train_dataset, tokenizer, max_seq_length=max_seq_length)
+        eval_dataset = (
+            _tokenize_old_trl_dataset(eval_dataset, tokenizer, max_seq_length=max_seq_length)
+            if eval_dataset is not None
+            else None
+        )
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
             data_collator=_build_old_trl_collator(tokenizer),
             callbacks=callbacks,
-            max_seq_length=max_seq_length,
-            dataset_text_field="text",
-            packing=False,
         )
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
