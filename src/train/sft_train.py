@@ -103,7 +103,7 @@ def build_training_arguments(
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_32bit",
         report_to=report_to,
-        remove_unused_columns=False,
+        remove_unused_columns=_NEW_TRL is True,
         seed=42,
         data_seed=42,
         load_best_model_at_end=True,
@@ -169,7 +169,7 @@ def _prepare_old_trl_dataset(dataset: Any) -> Any:
         return {"text": f"{example['prompt']}{example['completion']}"}
 
     text_dataset = dataset.map(add_text)
-    keep_columns = [column for column in text_dataset.column_names if column in {"text", "task"}]
+    keep_columns = ["text"]
     return text_dataset.remove_columns(
         [column for column in text_dataset.column_names if column not in keep_columns]
     )
