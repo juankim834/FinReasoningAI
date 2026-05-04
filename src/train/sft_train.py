@@ -325,6 +325,8 @@ def main(
     lora_target_modules: Optional[list[str]] = None,
     use_wandb: bool = False,
     resume_from_checkpoint: Optional[str] = None,
+    eval_steps: int = 100,
+    save_steps: int = 100,
 ) -> Any:
     """Train a QLoRA adapter on the processed prompt/completion dataset."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -358,6 +360,8 @@ def main(
         learning_rate=learning_rate,
         max_seq_length=max_seq_length,
         use_wandb=use_wandb,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
     )
 
     callbacks = [EarlyStoppingCallback(early_stopping_patience=5)]
