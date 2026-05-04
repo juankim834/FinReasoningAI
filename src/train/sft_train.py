@@ -154,6 +154,27 @@ def _build_old_trl_collator(tokenizer: AutoTokenizer) -> Any:
     )
 
 
+def _prepare_old_trl_dataset(dataset: Any) -> Any:
+    """
+    Convert a prompt/completion dataset into a single text-field dataset for TRL 0.8.x.
+
+    Older SFTTrainer versions require `dataset_text_field` or `formatting_func`
+    even when a custom completion-only collator is supplied.
+    """
+    required_columns = {"prompt", "completion"}
+    if not required_columns.issubset(set(dataset.column_names)):
+        return dataset
+
+    def add_text(example: dict[str, Any]) -> dict[str, str]:
+        return {"text": f"{example['prompt']}{example['completion']}"}
+
+    text_dataset = dataset.map(add_text)
+    keep_columns = [column for column in text_dataset.column_names if column in {"text", "task"}]
+    return text_dataset.remove_columns(
+        [column for column in text_dataset.column_names if column not in keep_columns]
+    )
+
+
 
 def main(
     model_id: str = DEFAULT_MODEL_ID,
@@ -213,6 +234,8 @@ def main(
             callbacks=callbacks,
         )
     else:
+        train_dataset = _prepare_old_trl_dataset(train_dataset)
+        eval_dataset = _prepare_old_trl_dataset(eval_dataset) if eval_dataset is not None else None
         trainer = SFTTrainer(
             model=model,
             args=training_args,
@@ -221,7 +244,7 @@ def main(
             data_collator=_build_old_trl_collator(tokenizer),
             callbacks=callbacks,
             max_seq_length=max_seq_length,
-            dataset_text_field=None,
+            dataset_text_field="text",
             packing=False,
         )
 
