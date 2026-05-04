@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 from importlib import import_module
 import logging
+import os
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -23,9 +24,17 @@ DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 MIN_BNB_VERSION = "0.46.1"
 
 def get_preferred_torch_dtype() -> torch.dtype:
-    """Choose bf16 when the active CUDA runtime supports it, else fp16."""
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
+    """
+    Return the safest default dtype for this project.
+
+    Qwen SFT on recent Colab stacks has shown unstable behavior in bf16 during
+    causal mask construction, so we default to fp16 unless the user explicitly
+    opts into bf16 with ``FINREASONING_USE_BF16=1``.
+    """
+    if os.environ.get("FINREASONING_USE_BF16", "").strip() == "1":
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        logger.warning("FINREASONING_USE_BF16=1 was set, but bf16 is unavailable. Falling back to fp16.")
     return torch.float16
 
 
