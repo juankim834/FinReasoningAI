@@ -18,6 +18,44 @@ PRIMARY_DATASETS = (
 )
 
 TASK_LABELS = ("financial_qa", "numerical_reasoning", "structured_analysis")
+FINANCE_KEYWORDS = (
+    "finance",
+    "financial",
+    "revenue",
+    "income",
+    "earnings",
+    "profit",
+    "loss",
+    "cash flow",
+    "balance sheet",
+    "market cap",
+    "stock",
+    "equity",
+    "debt",
+    "asset",
+    "liability",
+    "margin",
+    "ratio",
+    "valuation",
+    "ebitda",
+    "guidance",
+    "forecast",
+    "dividend",
+    "returns",
+    "investment",
+    "quarter",
+    "fiscal",
+)
+CODE_MARKERS = (
+    "def ",
+    "return ",
+    "for ",
+    "while ",
+    "class ",
+    "import ",
+    "print(",
+    "```",
+)
 
 
 def _stringify(value: Any) -> str:
@@ -126,7 +164,32 @@ def _normalize_sample(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _load_huggingface_rows() -> list[dict[str, Any]]:
+def _looks_like_code(text: str) -> bool:
+    """Return True when a string looks like source code rather than an answer."""
+    stripped = text.strip()
+    return any(marker in stripped for marker in CODE_MARKERS)
+
+
+def _is_financial_sample(sample: dict[str, Any]) -> bool:
+    """Filter out obviously off-domain rows such as generic coding tasks."""
+    blob = " ".join(
+        part.lower()
+        for part in (
+            sample.get("question", ""),
+            sample.get("answer", ""),
+            sample.get("chain_of_thought", ""),
+            sample.get("context", "") or "",
+        )
+        if part
+    )
+    if not blob:
+        return False
+    if _looks_like_code(sample.get("answer", "")) or _looks_like_code(sample.get("question", "")):
+        return False
+    return any(keyword in blob for keyword in FINANCE_KEYWORDS)
+
+
+def _load_huggingface_rows() -> tuple[list[dict[str, Any]], str]:
     """Try candidate Hugging Face datasets in priority order."""
     from datasets import load_dataset
 
@@ -138,7 +201,7 @@ def _load_huggingface_rows() -> list[dict[str, Any]]:
             rows: list[dict[str, Any]] = []
             for split in dataset.values():
                 rows.extend(split.to_list())
-            return rows
+            return rows, dataset_name
         except Exception as exc:  # pragma: no cover - depends on external availability
             last_error = exc
             logger.warning("Failed to load dataset %s: %s", dataset_name, exc)
@@ -175,12 +238,18 @@ def load_fincot_samples(
     if source not in {"huggingface", "local"}:
         raise ValueError("source must be either 'huggingface' or 'local'.")
 
-    raw_rows = _load_huggingface_rows() if source == "huggingface" else _load_local_rows(local_path)
+    if source == "huggingface":
+        raw_rows, source_name = _load_huggingface_rows()
+    else:
+        raw_rows = _load_local_rows(local_path)
+        source_name = local_path
 
     normalized: list[dict[str, Any]] = []
     for row in raw_rows:
         try:
-            normalized.append(_normalize_sample(row))
+            sample = _normalize_sample(row)
+            if _is_financial_sample(sample):
+                normalized.append(sample)
         except ValueError as exc:
             logger.debug("Skipping unusable row: %s", exc)
 
@@ -191,6 +260,7 @@ def load_fincot_samples(
 
     task_counts = Counter(sample["task"] for sample in normalized)
     summary = ", ".join(f"{task}={count}" for task, count in sorted(task_counts.items()))
+    print(f"Dataset source: {source_name}")
     print(f"Loaded {len(normalized)} FinCoT samples.")
     print(f"Task distribution: {summary}")
     return normalized
