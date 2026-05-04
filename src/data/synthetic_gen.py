@@ -1,4 +1,9 @@
 """
+Deprecated: synthetic data generation is retained for legacy experiments.
+
+New training runs should use `src.data.fincot_loader.load_fincot_samples`
+with the public FinCoT-style datasets described in the Colab notebook.
+
 File: src/data/synthetic_gen.py
 
 Step 2c — Synthetic Data Generation
