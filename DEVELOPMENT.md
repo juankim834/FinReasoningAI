@@ -111,17 +111,19 @@ Primary metrics live in `src/eval/evaluate.py`: exact match (numeric-aware), F1,
 
 **Symptom:** `trl/trainer/utils.py: UserWarning: Could not find response key Answer: in the following instance: You are an expert with extensive financial knowledge…`
 
-**Root causes (both must be understood together):**
+**Root causes:**
 
-1. `DataCollatorForCompletionOnlyLM` receives pre-tokenized sequences and scans their token IDs for the `response_template` subsequence. The old code used `response_template="Answer:"`. `Answer:` is placed at the **start of the completion**, i.e. at the END of the full `text` string. When the prompt is long (tool-JSON schema block + large table context), right-side truncation at `max_length=2048` cuts `Answer:` off before the collator sees it. The collator warns and masks all labels to `-100` → zero gradient for that sample.
+1. `DataCollatorForCompletionOnlyLM` receives pre-tokenized sequences and scans their token IDs for the `response_template` subsequence. The old code used `response_template="Answer:"`. `Answer:` is placed at the **start of the completion** — the END of the full `text` string. When the prompt is long (tool-JSON schema block + large table context), right-side truncation at `max_length=2048` cuts `Answer:` off before the collator sees it → warns, masks all labels to `-100`, zero gradient.
 
-2. Some samples from external datasets loaded by `fincot_loader` use a different system prompt ("You are an expert with extensive financial knowledge and strong programming skills…") that does not follow the `Answer:` convention. Even after `add_text` prepends `Answer:`, the combined text may exceed 2048 tokens and hit the truncation boundary.
+2. Some external samples (FinQA-style flat text starting with "Please answer the given financial question…") are stored **without ChatML wrapping**. The `<|im_start|>assistant\n` marker that the collator searches for is simply not present in the token IDs → same warning with the new token template `[151644, 77091, 198]`. These samples also exhibit a **double `Answer:Answer:`** bug: the flat-format prompt appends its own trailing `Answer:`, which concatenates with the completion's `Answer:` prefix.
+
+3. Some other external samples use a non-standard system prompt ("You are an expert with extensive financial knowledge…") and don't follow the `Answer:` convention at all.
 
 **Fix applied in `src/train/sft_train.py`:**
 
-- `_build_old_trl_collator` now uses the **ChatML assistant-turn token IDs** (`<|im_start|>assistant\n`) as `response_template` instead of the string `"Answer:"`. These tokens are structurally part of the *prompt* (produced by `apply_chat_template`) and appear **before** the completion, so they are never affected by completion-side truncation. All tokens after the assistant marker receive loss — including any CoT and the `Answer:` line.
-- `_prepare_old_trl_dataset` (`add_text`) always normalizes completions to start cleanly with `Answer:` and concatenates directly onto the prompt without an extra newline (the prompt from `apply_chat_template` already ends with `\n`).
-- `_tokenize_old_trl_dataset` now filters out samples whose full tokenized length exceeds `max_seq_length`, logging a warning and dropping them to prevent wasting training iterations on nearly-empty completions.
+- `_build_old_trl_collator` uses the **ChatML assistant-turn token IDs** (`<|im_start|>assistant\n`) as `response_template`. These live in the prompt portion and are never affected by completion-side truncation.
+- `_prepare_old_trl_dataset` now accepts a `tokenizer` parameter. `add_text` detects prompts that lack `<|im_start|>assistant`: strips any trailing `Answer:` from the raw prompt (regex `\s*Answer:\s*$`) and re-wraps the content with `tokenizer.apply_chat_template(..., add_generation_prompt=True)`, ensuring the marker is always present regardless of source format.
+- `_tokenize_old_trl_dataset` passes `tokenizer` into `_prepare_old_trl_dataset` and applies a **two-stage length filter**: hard-drop samples over `max_train_length` (default 4096); truncate samples between `max_seq_length` (2048) and `max_train_length` during tokenisation (safe because the marker lives in the prompt).
 
 **A100 40 GB batch size:** Default notebook config updated from `BATCH_SIZE=4` to `BATCH_SIZE=2` with `GRAD_ACCUM=16` (same effective batch of 32). The 40 GB A100 peaks at ~30–38 GB during training; `BATCH_SIZE=4` at `max_seq_length=2048` risks OOM.
 

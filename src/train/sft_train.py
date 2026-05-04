@@ -6,6 +6,7 @@ import importlib.metadata
 import inspect
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -178,29 +179,62 @@ def _build_old_trl_collator(tokenizer: AutoTokenizer) -> Any:
     )
 
 
-def _prepare_old_trl_dataset(dataset: Any) -> Any:
+_ASSISTANT_MARKER = "<|im_start|>assistant"
+# Matches a bare "Answer:" that some flat-format datasets append to the prompt.
+_TRAILING_ANSWER_RE = re.compile(r"\s*Answer:\s*$")
+
+
+def _prepare_old_trl_dataset(
+    dataset: Any,
+    tokenizer: Optional[AutoTokenizer] = None,
+) -> Any:
     """
     Convert a prompt/completion dataset into a single text-field dataset for TRL 0.8.x.
 
-    Older SFTTrainer versions require `dataset_text_field` or `formatting_func`
-    even when a custom completion-only collator is supplied.
+    Two issues are addressed here:
 
-    All completions are normalised to start with "Answer:" so the model always
-    learns the response prefix, regardless of which source dataset the sample
-    came from (some external datasets use a different system-prompt style and
-    omit the "Answer:" prefix entirely).
+    1. **Non-ChatML prompts** – Some external samples (e.g. FinQA-style flat text
+       starting with "Please answer the given financial question…") are stored
+       without the ChatML ``<|im_start|>assistant\\n`` marker.  The collator's
+       response template can never match in those sequences.  When a tokenizer
+       is supplied, such prompts are re-wrapped with ``apply_chat_template``
+       (``add_generation_prompt=True``) so the marker is always present.
+
+    2. **Double "Answer:" prefix** – Flat-format prompts often end with
+       "Answer:" (as part of the question template), while the stored completion
+       also starts with "Answer:".  Concatenating them naively produces
+       "Answer:Answer:…".  The trailing "Answer:" is stripped from the prompt
+       before concatenation.
     """
     required_columns = {"prompt", "completion"}
     if not required_columns.issubset(set(dataset.column_names)):
         return dataset
 
     def add_text(example: dict[str, Any]) -> dict[str, str]:
-        # `prompt` is produced by apply_chat_template and ends with
-        # "<|im_start|>assistant\n" (no extra newline needed here).
         completion = str(example["completion"]).lstrip()
         if not completion.startswith(RESPONSE_TEMPLATE):
             completion = f"{RESPONSE_TEMPLATE} {completion}"
-        text = f"{example['prompt']}{completion}"
+
+        prompt = str(example["prompt"])
+
+        if _ASSISTANT_MARKER not in prompt:
+            # Strip trailing "Answer:" that flat-format prompts append.
+            clean_prompt = _TRAILING_ANSWER_RE.sub("", prompt).strip()
+            if tokenizer is not None:
+                # Re-wrap in ChatML so the response template is always present.
+                prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": clean_prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            else:
+                # Minimal fallback when no tokenizer is available.
+                prompt = (
+                    f"<|im_start|>user\n{clean_prompt}<|im_end|>\n"
+                    f"<|im_start|>assistant\n"
+                )
+
+        text = f"{prompt}{completion}"
         return {"text": text}
 
     text_dataset = dataset.map(add_text)
@@ -210,38 +244,39 @@ def _prepare_old_trl_dataset(dataset: Any) -> Any:
     )
 
 
-def _tokenize_old_trl_dataset(dataset: Any, tokenizer: AutoTokenizer, max_seq_length: int) -> Any:
+def _tokenize_old_trl_dataset(
+    dataset: Any,
+    tokenizer: AutoTokenizer,
+    max_seq_length: int,
+    max_train_length: int = 4096,
+) -> Any:
     """
     Tokenize text examples for the legacy TRL/Trainer path.
 
-    This avoids relying on old SFTTrainer preprocessing behavior, which can leave
-    raw string fields in the collator path and trigger tensor conversion errors.
-
-    Samples where the *prompt* alone would consume >= max_seq_length -
-    _MIN_COMPLETION_TOKENS tokens are dropped before tokenisation.  These
-    samples would have their entire completion truncated away, leaving the
-    collator nothing to compute loss on regardless of the response template.
+    Two-stage length handling:
+    1. Hard-drop any sample whose full tokenized length exceeds ``max_train_length``
+       (default 4096).  These samples are almost entirely prompt; even after
+       truncation to ``max_seq_length`` they would leave almost no completion
+       tokens, wasting a training step and potentially skewing the loss.
+    2. Samples between ``max_seq_length`` and ``max_train_length`` are *kept*
+       and right-truncated to ``max_seq_length`` during tokenisation.  With the
+       ChatML assistant-turn marker as the response template this is safe: the
+       marker lives in the prompt portion and is never truncated away.
     """
-    text_dataset = _prepare_old_trl_dataset(dataset)
+    text_dataset = _prepare_old_trl_dataset(dataset, tokenizer=tokenizer)
 
-    def _has_room(example: dict[str, Any]) -> bool:
-        """Return True when enough tokens remain for a meaningful completion.
-
-        A sample whose total tokenized length already exceeds max_seq_length
-        will be right-truncated; if the completion portion is ≤ _MIN_COMPLETION_TOKENS
-        after truncation the sample contributes nothing useful to training.
-        """
+    def _within_hard_limit(example: dict[str, Any]) -> bool:
+        """Drop samples longer than max_train_length tokens."""
         ids = tokenizer(
             example["text"],
             truncation=False,
             add_special_tokens=False,
         )["input_ids"]
-        if len(ids) > max_seq_length:
+        if len(ids) > max_train_length:
             logger.warning(
-                "Dropping training sample: tokenized length %d > max_seq_length %d "
-                "(completion would be fully or nearly truncated).",
+                "Dropping training sample: tokenized length %d > max_train_length %d.",
                 len(ids),
-                max_seq_length,
+                max_train_length,
             )
             return False
         return True
@@ -249,7 +284,12 @@ def _tokenize_old_trl_dataset(dataset: Any, tokenizer: AutoTokenizer, max_seq_le
     # Filter only when the dataset is small enough that per-sample tokenization
     # is cheap; skip for very large datasets to avoid double-tokenization cost.
     if len(text_dataset) <= 20_000:
-        text_dataset = text_dataset.filter(_has_room)
+        before = len(text_dataset)
+        text_dataset = text_dataset.filter(_within_hard_limit)
+        dropped = before - len(text_dataset)
+        if dropped:
+            logger.info("Dropped %d / %d samples exceeding max_train_length=%d.",
+                        dropped, before, max_train_length)
 
     def tokenize_batch(batch: dict[str, Any]) -> dict[str, Any]:
         return tokenizer(
@@ -278,6 +318,7 @@ def main(
     gradient_checkpointing: bool = True,
     learning_rate: float = 2e-4,
     max_seq_length: int = 2048,
+    max_train_length: int = 4096,
     lora_r: int = 64,
     lora_alpha: int = 128,
     lora_dropout: float = 0.05,
@@ -331,9 +372,15 @@ def main(
             callbacks=callbacks,
         )
     else:
-        train_dataset = _tokenize_old_trl_dataset(train_dataset, tokenizer, max_seq_length=max_seq_length)
+        train_dataset = _tokenize_old_trl_dataset(
+            train_dataset, tokenizer,
+            max_seq_length=max_seq_length, max_train_length=max_train_length,
+        )
         eval_dataset = (
-            _tokenize_old_trl_dataset(eval_dataset, tokenizer, max_seq_length=max_seq_length)
+            _tokenize_old_trl_dataset(
+                eval_dataset, tokenizer,
+                max_seq_length=max_seq_length, max_train_length=max_train_length,
+            )
             if eval_dataset is not None
             else None
         )
@@ -403,6 +450,8 @@ if __name__ == "__main__":
                         help="Disable gradient checkpointing (trades memory for speed)")
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument("--max_train_length", type=int, default=4096,
+                        help="Hard-drop samples longer than this many tokens before training.")
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=128)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -420,6 +469,7 @@ if __name__ == "__main__":
         gradient_checkpointing=not args.no_gradient_checkpointing,
         learning_rate=args.learning_rate,
         max_seq_length=args.max_seq_length,
+        max_train_length=args.max_train_length,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
