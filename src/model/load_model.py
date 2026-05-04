@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 from importlib import import_module
+import functools
 import logging
 import os
 from pathlib import Path
@@ -36,6 +37,61 @@ def get_preferred_torch_dtype() -> torch.dtype:
             return torch.bfloat16
         logger.warning("FINREASONING_USE_BF16=1 was set, but bf16 is unavailable. Falling back to fp16.")
     return torch.float16
+
+
+@functools.lru_cache(maxsize=1)
+def enable_safe_bf16_causal_mask_patch() -> bool:
+    """
+    Patch older Transformers causal-mask construction for bf16 stability.
+
+    Some Colab/PyTorch/Transformers combinations overflow when building the
+    Qwen causal mask with ``torch.finfo(torch.bfloat16).min``. A large finite
+    negative value works equivalently for masking while avoiding that runtime.
+    """
+    try:
+        from transformers import modeling_attn_mask_utils as mask_utils
+    except Exception as exc:  # pragma: no cover - import environment specific
+        logger.warning("Unable to patch bf16 causal mask helper: %s", exc)
+        return False
+
+    original = mask_utils.AttentionMaskConverter._make_causal_mask
+    if getattr(original, "_finreasoning_safe_bf16_patch", False):
+        return True
+
+    def patched_make_causal_mask(
+        input_ids_shape: torch.Size,
+        dtype: torch.dtype,
+        device: torch.device,
+        past_key_values_length: int = 0,
+        sliding_window: int | None = None,
+    ):
+        mask_utils.warnings.warn(mask_utils.DEPRECATION_MESSAGE, FutureWarning)
+
+        bsz, tgt_len = input_ids_shape
+        mask_value = -1e4 if dtype == torch.bfloat16 else torch.finfo(dtype).min
+        base_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
+        mask = torch.full((tgt_len, tgt_len), mask_value, device=device, dtype=base_dtype)
+        mask_cond = torch.arange(mask.size(-1), device=device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(dtype)
+
+        if past_key_values_length > 0:
+            prefix = torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device)
+            mask = torch.cat([prefix, mask], dim=-1)
+
+        if sliding_window is not None:
+            diagonal = past_key_values_length - sliding_window - 1
+            context_mask = torch.tril(torch.ones_like(mask, dtype=torch.bool), diagonal=diagonal)
+            if mask_utils.is_torchdynamo_compiling():
+                mask = mask.clone()
+            mask.masked_fill_(context_mask, mask_value)
+
+        return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+    patched_make_causal_mask._finreasoning_safe_bf16_patch = True  # type: ignore[attr-defined]
+    mask_utils.AttentionMaskConverter._make_causal_mask = staticmethod(patched_make_causal_mask)
+    logger.info("Enabled safe bf16 causal-mask patch for Transformers.")
+    return True
 
 
 DEFAULT_BNB_CONFIG = BitsAndBytesConfig(
@@ -125,6 +181,9 @@ def load_model_and_tokenizer(
     if bnb_config is None:
         bnb_config = DEFAULT_BNB_CONFIG
     preferred_dtype = get_preferred_torch_dtype()
+
+    if preferred_dtype == torch.bfloat16:
+        enable_safe_bf16_causal_mask_patch()
 
     _check_vram(required_gb=10.0)
     _validate_bitsandbytes_installation()
