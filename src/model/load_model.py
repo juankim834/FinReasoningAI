@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Tuple
+import warnings
 
 import torch
 from transformers import (
@@ -65,7 +66,9 @@ def enable_safe_bf16_causal_mask_patch() -> bool:
         past_key_values_length: int = 0,
         sliding_window: int | None = None,
     ):
-        mask_utils.warnings.warn(mask_utils.DEPRECATION_MESSAGE, FutureWarning)
+        deprecation_message = getattr(mask_utils, "DEPRECATION_MESSAGE", None)
+        if deprecation_message:
+            warnings.warn(deprecation_message, FutureWarning)
 
         bsz, tgt_len = input_ids_shape
         mask_value = -1e4 if dtype == torch.bfloat16 else torch.finfo(dtype).min
