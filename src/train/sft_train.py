@@ -78,6 +78,7 @@ def build_training_arguments(
     gradient_accumulation_steps: int = 8,
     learning_rate: float = 2e-4,
     max_seq_length: int = 2048,
+    gradient_checkpointing: bool = True,
     warmup_steps: int = 50,
     logging_steps: int = 10,
     eval_steps: int = 100,
@@ -105,8 +106,8 @@ def build_training_arguments(
         eval_steps=eval_steps,
         bf16=use_bf16,
         fp16=not use_bf16,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing=gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else {},
         optim="paged_adamw_32bit",
         report_to=report_to,
         remove_unused_columns=_NEW_TRL is True,
@@ -274,6 +275,7 @@ def main(
     num_train_epochs: int = 1,
     per_device_train_batch_size: int = 4,
     gradient_accumulation_steps: int = 8,
+    gradient_checkpointing: bool = True,
     learning_rate: float = 2e-4,
     max_seq_length: int = 2048,
     lora_r: int = 64,
@@ -301,7 +303,7 @@ def main(
         lora_dropout=lora_dropout,
         lora_target_modules=lora_target_modules,
     )
-    model = apply_qlora(model, lora_config=lora_config, gradient_checkpointing=True)
+    model = apply_qlora(model, lora_config=lora_config, gradient_checkpointing=gradient_checkpointing)
 
     dataset = load_datasets(data_dir)
     train_dataset = dataset["train"]
@@ -311,6 +313,7 @@ def main(
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
         learning_rate=learning_rate,
         max_seq_length=max_seq_length,
         use_wandb=use_wandb,
@@ -396,6 +399,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--per_device_train_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--no_gradient_checkpointing", action="store_true",
+                        help="Disable gradient checkpointing (trades memory for speed)")
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--max_seq_length", type=int, default=2048)
     parser.add_argument("--lora_r", type=int, default=64)
@@ -412,6 +417,7 @@ if __name__ == "__main__":
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
         learning_rate=args.learning_rate,
         max_seq_length=args.max_seq_length,
         lora_r=args.lora_r,
