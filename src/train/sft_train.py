@@ -13,6 +13,7 @@ import torch
 from datasets import DatasetDict, load_from_disk
 from peft import LoraConfig, TaskType
 from transformers import AutoTokenizer, EarlyStoppingCallback, Trainer
+from src.model.load_model import get_preferred_torch_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,8 @@ def build_training_arguments(
     use_wandb: bool = False,
 ) -> Any:
     """Build trainer arguments for either old or new TRL releases."""
+    preferred_dtype = get_preferred_torch_dtype()
+    use_bf16 = preferred_dtype == torch.bfloat16
     report_to = ["wandb"] if use_wandb and os.environ.get("WANDB_API_KEY") else ["none"]
     common_kwargs = dict(
         output_dir=output_dir,
@@ -97,8 +100,8 @@ def build_training_arguments(
         save_steps=save_steps,
         eval_strategy="steps",
         eval_steps=eval_steps,
-        bf16=True,
-        fp16=False,
+        bf16=use_bf16,
+        fp16=not use_bf16,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_32bit",

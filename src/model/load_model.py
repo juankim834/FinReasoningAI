@@ -22,10 +22,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 MIN_BNB_VERSION = "0.46.1"
 
+def get_preferred_torch_dtype() -> torch.dtype:
+    """Choose bf16 when the active CUDA runtime supports it, else fp16."""
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 DEFAULT_BNB_CONFIG = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_compute_dtype=get_preferred_torch_dtype(),
     bnb_4bit_use_double_quant=True,
 )
 
@@ -108,6 +115,7 @@ def load_model_and_tokenizer(
     """Load a quantized Qwen model and tokenizer for QLoRA training."""
     if bnb_config is None:
         bnb_config = DEFAULT_BNB_CONFIG
+    preferred_dtype = get_preferred_torch_dtype()
 
     _check_vram(required_gb=10.0)
     _validate_bitsandbytes_installation()
@@ -143,7 +151,7 @@ def load_model_and_tokenizer(
             device_map=device_map,
             trust_remote_code=trust_remote_code,
             attn_implementation=attn_implementation,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=preferred_dtype,
         )
     except (ImportError, ValueError, RuntimeError) as exc:
         if is_bnb_triton_error(exc):
@@ -161,7 +169,7 @@ def load_model_and_tokenizer(
                 device_map=device_map,
                 trust_remote_code=trust_remote_code,
                 attn_implementation="eager",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=preferred_dtype,
             )
         else:
             raise
@@ -182,7 +190,12 @@ def load_model_and_tokenizer(
 
 def get_default_bnb_config() -> BitsAndBytesConfig:
     """Return the default 4-bit bitsandbytes config."""
-    return DEFAULT_BNB_CONFIG
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=get_preferred_torch_dtype(),
+        bnb_4bit_use_double_quant=True,
+    )
 
 
 
