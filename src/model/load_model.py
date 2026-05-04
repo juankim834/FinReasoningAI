@@ -1,30 +1,8 @@
-"""
-File: src/model/load_model.py
-
-Step 1 — Model Selection & Loading
-
-WHY Qwen2.5-14B over alternatives:
-  - vs LLaMA-3.1-8B / Mistral-7B: 14B parameters significantly outperform 7–8B
-    on multi-step numerical reasoning. FinQA benchmarks show ~8–12pt EM gain.
-  - vs Phi-3-medium (14B): Qwen2.5-14B has a 128k token context window vs Phi-3's
-    4k, essential for long 10-K / earnings transcript passages.
-  - Financial tokenization: Qwen2.5 was trained on a large multilingual corpus
-    including financial documents; its tokenizer handles "$", "%", "bps", "EBITDA"
-    as single or minimal subword units — reducing representation fragmentation.
-  - Numeric handling: Qwen2.5 shows strong arithmetic consistency via its
-    structured pretraining on code + math data, critical for numerical reasoning.
-  - A100 80GB compatibility: 14B in 4-bit NF4 ≈ 8–9 GB base model VRAM.
-    Adding LoRA adapters, optimizer states, and activations stays well within 80GB.
-
-VRAM estimates (rough):
-  Inference (4-bit):   ~8–9 GB for weights + ~2–4 GB KV cache @ 2048 ctx = ~12 GB
-  Training  (QLoRA):   ~8–9 GB weights + ~6–8 GB LoRA grads/optimizer +
-                        ~14–16 GB activations (grad ckpt) + batch buffer ≈ 38–42 GB
-  Headroom on A100:    80 GB − 42 GB ≈ 38 GB → safe margin
-"""
+"""Model loading utilities for training and inference."""
 
 from __future__ import annotations
 
+import importlib
 from importlib import import_module
 import logging
 from typing import Any, Tuple
@@ -40,34 +18,83 @@ from transformers import (
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
-
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
+MIN_BNB_VERSION = "0.46.1"
 
-# 4-bit NF4 double-quantization config (saves ~15% VRAM vs single quant)
 DEFAULT_BNB_CONFIG = BitsAndBytesConfig(
     load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",           # NF4 is optimal for normally-distributed weights
-    bnb_4bit_compute_dtype=torch.bfloat16,  # BF16 compute preserves dynamic range
-    bnb_4bit_use_double_quant=True,       # double quantization: quantize the quantization constants
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
 )
 
 
+def _parse_version(version: str) -> tuple[int, ...]:
+    """Convert a dotted version string into an integer tuple."""
+    return tuple(int(part) for part in version.split(".") if part.isdigit())
+
+
+
 def _check_vram(required_gb: float = 12.0) -> None:
-    """Warn if available VRAM is below the required threshold."""
+    """Warn or fail when available VRAM is below the requested threshold."""
     if not torch.cuda.is_available():
-        logger.warning("No CUDA device detected. Model will load on CPU — this is extremely slow.")
+        logger.warning("No CUDA device detected. Model will load on CPU and be extremely slow.")
         return
     free_gb = torch.cuda.mem_get_info()[0] / 1e9
     total_gb = torch.cuda.mem_get_info()[1] / 1e9
     logger.info("VRAM available: %.1f GB / %.1f GB total", free_gb, total_gb)
     if free_gb < required_gb:
         raise RuntimeError(
-            f"Insufficient VRAM: {free_gb:.1f} GB free, need ≥{required_gb:.1f} GB. "
-            "Ensure no other processes are using the GPU."
+            f"Insufficient VRAM: {free_gb:.1f} GB free, need at least {required_gb:.1f} GB. "
+            "Ensure no other GPU processes are active."
         )
+
+
+
+def _validate_bitsandbytes_installation() -> None:
+    """
+    Validate that bitsandbytes imports cleanly and has CUDA support.
+
+    Colab Python 3.12 runtimes can end up with a CPU-only wheel or an older
+    bitsandbytes build that crashes on Triton 3.x with `triton.ops` import errors.
+    """
+    try:
+        bnb = importlib.import_module("bitsandbytes")
+    except Exception as exc:  # pragma: no cover - depends on runtime package state
+        msg = str(exc)
+        if "triton.ops" in msg:
+            raise RuntimeError(
+                "bitsandbytes failed to import because this runtime has a newer Triton layout and "
+                "the installed bitsandbytes wheel is too old.\n"
+                f"Fix in Colab: pip uninstall -y bitsandbytes && pip install -U bitsandbytes=={MIN_BNB_VERSION}\n"
+                "Then restart the runtime and rerun the notebook from the install cell."
+            ) from exc
+        raise RuntimeError(
+            "bitsandbytes could not be imported. Reinstall it in Colab with:\n"
+            f"  pip uninstall -y bitsandbytes && pip install -U bitsandbytes=={MIN_BNB_VERSION}\n"
+            "Then restart the runtime."
+        ) from exc
+
+    bnb_version = getattr(bnb, "__version__", "0.0.0")
+    if _parse_version(bnb_version) < _parse_version(MIN_BNB_VERSION):
+        raise RuntimeError(
+            f"bitsandbytes {bnb_version} is too old for the current Colab Triton stack.\n"
+            f"Install bitsandbytes=={MIN_BNB_VERSION} or newer, then restart the runtime."
+        )
+
+    try:
+        cextension = importlib.import_module("bitsandbytes.cextension")
+        compiled_with_cuda = getattr(cextension, "COMPILED_WITH_CUDA", None)
+    except Exception:
+        compiled_with_cuda = None
+
+    if compiled_with_cuda is False:
+        raise RuntimeError(
+            "bitsandbytes imported, but the installed wheel does not have GPU support.\n"
+            f"Fix in Colab: pip uninstall -y bitsandbytes && pip install -U bitsandbytes=={MIN_BNB_VERSION}\n"
+            "Then restart the runtime before loading the model."
+        )
+
 
 
 def load_model_and_tokenizer(
@@ -77,61 +104,32 @@ def load_model_and_tokenizer(
     trust_remote_code: bool = True,
     attn_implementation: str = "flash_attention_2",
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
-    """
-    Load Qwen2.5-14B-Instruct in 4-bit NF4 quantization, ready for QLoRA.
-
-    Args:
-        model_id:            HuggingFace model ID. Default: Qwen/Qwen2.5-14B-Instruct
-        bnb_config:          BitsAndBytesConfig. If None, uses DEFAULT_BNB_CONFIG.
-        device_map:          Accelerate device map. "auto" works for single GPU.
-        trust_remote_code:   Required for Qwen models (custom attention code).
-        attn_implementation: "flash_attention_2" (preferred) or "eager".
-
-    Returns:
-        (model, tokenizer) ready for PEFT / SFT training.
-
-    Memory: ~38–42 GB VRAM during training with bs=4, grad_ckpt=True.
-    """
+    """Load a quantized Qwen model and tokenizer for QLoRA training."""
     if bnb_config is None:
         bnb_config = DEFAULT_BNB_CONFIG
 
     _check_vram(required_gb=10.0)
+    _validate_bitsandbytes_installation()
 
     logger.info("Loading tokenizer from %s", model_id)
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
         trust_remote_code=trust_remote_code,
-        padding_side="right",   # right-padding required by SFTTrainer's packing
+        padding_side="right",
     )
-    # Qwen2.5 uses <|endoftext|> as pad; set explicitly to avoid warnings
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         logger.info("pad_token set to eos_token: %s", tokenizer.eos_token)
 
     logger.info("Loading model from %s (4-bit NF4, double_quant=True)", model_id)
 
-    # Flash Attention 2 requires compute_dtype=bfloat16 and CUDA >= 8.0 (A100 = 8.0).
-    # Fall back to "eager" if flash-attn is not installed.
-    #
-    # Exception hierarchy to handle:
-    #   ImportError  — flash_attn package missing (raised by transformers directly)
-    #   ValueError   — attn_implementation value rejected by model config
-    #   RuntimeError — transformers wraps a deeper ImportError (e.g. bitsandbytes
-    #                  importing from triton.ops which was removed in Triton 3.x)
-    #                  as RuntimeError("Failed to import transformers.integrations...")
-    #
-    # The bitsandbytes/triton error is NOT related to Flash Attention and should NOT
-    # be silenced here — it means bitsandbytes itself is broken (wrong version).
-    # The check below only silences the fallback when the error is flash-attention-
-    # specific; all other errors are re-raised with a helpful message.
+    flash_keywords = ("flash", "attn_implementation", "flash_attn")
 
-    _FLASH_KEYWORDS = ("flash", "attn_implementation", "flash_attn")
-
-    def _is_flash_error(exc: Exception) -> bool:
+    def is_flash_error(exc: Exception) -> bool:
         msg = str(exc).lower()
-        return any(kw in msg for kw in _FLASH_KEYWORDS)
+        return any(keyword in msg for keyword in flash_keywords)
 
-    def _is_bnb_triton_error(exc: Exception) -> bool:
+    def is_bnb_triton_error(exc: Exception) -> bool:
         msg = str(exc)
         return "triton.ops" in msg or "triton_based_modules" in msg or (
             "bitsandbytes" in msg and "import" in msg.lower()
@@ -147,16 +145,15 @@ def load_model_and_tokenizer(
             torch_dtype=torch.bfloat16,
         )
     except (ImportError, ValueError, RuntimeError) as exc:
-        if _is_bnb_triton_error(exc):
+        if is_bnb_triton_error(exc):
             raise RuntimeError(
                 "bitsandbytes failed to import due to a Triton version mismatch.\n"
-                "This happens when bitsandbytes < 0.44.0 is installed alongside Triton 3.x.\n"
-                "Fix: run  pip install -U 'bitsandbytes>=0.44.0'  and restart the runtime."
+                f"This Colab runtime needs bitsandbytes>={MIN_BNB_VERSION}.\n"
+                f"Fix: run pip uninstall -y bitsandbytes && pip install -U bitsandbytes=={MIN_BNB_VERSION}\n"
+                "Then restart the runtime."
             ) from exc
-        if _is_flash_error(exc):
-            logger.warning(
-                "Flash Attention 2 not available (%s). Falling back to eager attention.", exc
-            )
+        if is_flash_error(exc):
+            logger.warning("Flash Attention 2 not available (%s). Falling back to eager attention.", exc)
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 quantization_config=bnb_config,
@@ -168,14 +165,11 @@ def load_model_and_tokenizer(
         else:
             raise
 
-    # Disable cache during training (incompatible with gradient checkpointing)
     model.config.use_cache = False
-    model.config.pretraining_tp = 1  # avoid tensor-parallel issues with PEFT
+    model.config.pretraining_tp = 1
 
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(
-        "Model loaded. Total parameters: %.2fB (stored in 4-bit NF4)", total_params / 1e9
-    )
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    logger.info("Model loaded. Total parameters: %.2fB", total_params / 1e9)
 
     if torch.cuda.is_available():
         used_gb = torch.cuda.memory_allocated() / 1e9
@@ -184,9 +178,11 @@ def load_model_and_tokenizer(
     return model, tokenizer
 
 
+
 def get_default_bnb_config() -> BitsAndBytesConfig:
-    """Return the default 4-bit NF4 double-quantization config."""
+    """Return the default 4-bit bitsandbytes config."""
     return DEFAULT_BNB_CONFIG
+
 
 
 def load_vllm_model_and_tokenizer(
@@ -200,13 +196,7 @@ def load_vllm_model_and_tokenizer(
     enable_lora: bool = False,
     **llm_kwargs: Any,
 ) -> Tuple[Any, PreTrainedTokenizerBase]:
-    """
-    Load the inference model through vLLM.
-
-    This is intended for merged checkpoints or base models. For LoRA adapters,
-    either merge the adapter first or pass vLLM-specific LoRA settings via
-    ``llm_kwargs`` and the downstream serving layer.
-    """
+    """Load the model through vLLM for inference."""
     _check_vram(required_gb=10.0)
 
     logger.info("Loading tokenizer from %s", model_id)
@@ -221,7 +211,6 @@ def load_vllm_model_and_tokenizer(
 
     logger.info("Loading vLLM engine from %s", model_id)
     LLM = import_module("vllm").LLM
-
     model = LLM(
         model=model_id,
         tokenizer=model_id,
@@ -233,13 +222,8 @@ def load_vllm_model_and_tokenizer(
         enable_lora=enable_lora,
         **llm_kwargs,
     )
-
     return model, tokenizer
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Standalone test / demo
-# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
@@ -248,19 +232,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Load Qwen2.5-14B and print model info")
     parser.add_argument("--model_id", default=DEFAULT_MODEL_ID)
-    parser.add_argument("--attn", default="flash_attention_2",
-                        choices=["flash_attention_2", "eager"])
+    parser.add_argument("--attn", default="flash_attention_2", choices=["flash_attention_2", "eager"])
     args = parser.parse_args()
 
-    model, tokenizer = load_model_and_tokenizer(
-        model_id=args.model_id,
-        attn_implementation=args.attn,
-    )
-
-    # Quick sanity-check forward pass
+    model, tokenizer = load_model_and_tokenizer(model_id=args.model_id, attn_implementation=args.attn)
     sample = tokenizer("What is the EBITDA margin?", return_tensors="pt").to(model.device)
     with torch.no_grad():
         out = model(**sample)
-    print(f"\n[OK] Forward pass OK — logits shape: {out.logits.shape}")
+    print(f"\n[OK] Forward pass OK - logits shape: {out.logits.shape}")
     print(f"   Vocab size: {out.logits.shape[-1]}")
     print(f"   VRAM used: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
