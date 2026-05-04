@@ -426,6 +426,12 @@ def generate_prediction(
         gen_kwargs["top_p"] = 0.9
     else:
         gen_kwargs["do_sample"] = False
+        # Explicitly neutralise Qwen's generation_config defaults (temperature=0.7,
+        # top_p=0.8, top_k=20) to suppress the UserWarning fired when these
+        # sampling params are set while do_sample=False.
+        gen_kwargs["temperature"] = 1.0
+        gen_kwargs["top_p"] = 1.0
+        gen_kwargs["top_k"] = 0
 
     with torch.no_grad():
         output_ids = model.generate(**inputs, **gen_kwargs)

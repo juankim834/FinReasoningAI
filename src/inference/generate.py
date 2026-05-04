@@ -289,8 +289,12 @@ def _generate_once_transformers(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
-            temperature=temperature if do_sample else None,
-            top_p=top_p if do_sample else None,
+            # Explicitly neutralise Qwen's generation_config defaults (temperature=0.7,
+            # top_p=0.8, top_k=20) when doing greedy decoding to suppress the
+            # "do_sample=False but temperature/top_p/top_k are set" UserWarning.
+            temperature=temperature if do_sample else 1.0,
+            top_p=top_p if do_sample else 1.0,
+            top_k=None if do_sample else 0,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             logits_processor=processors if processors else None,
