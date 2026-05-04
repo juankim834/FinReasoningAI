@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 _TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 
+# Allowed tool names and valid arithmetic operations for schema validation.
+_ALLOWED_TOOLS = {"arithmetic", "compound_growth_rate"}
+_ARITHMETIC_OPS = {"add", "subtract", "multiply", "divide", "percent_change"}
+
 
 def _strip_code_fences(text: str) -> str:
     """Remove optional markdown code fences around JSON payloads."""
@@ -71,23 +75,65 @@ def dispatch_tool_call(tool_name: str, tool_args: dict[str, Any]) -> dict[str, A
 
 
 def parse_tool_call_from_output(model_output: str) -> Optional[dict[str, Any]]:
-    """Parse Qwen-style tool-call JSON from model output."""
-    match = _TOOL_CALL_PATTERN.search(model_output)
-    if not match:
+    """Parse a custom <tool_call>...</tool_call> block from model output.
+
+    Returns:
+        ``None``
+            No ``<tool_call>`` block was found.  The caller should treat this
+            turn as the model's final answer.
+        ``{"ok": True, "call": {"name": ..., "arguments": {...}}, "error": None}``
+            A single, well-formed tool call was parsed and validated.
+        ``{"ok": False, "call": None, "error": "<reason>"}``
+            A block was found but is malformed (multiple blocks, bad JSON,
+            missing fields, or invalid enum value).  The caller should log the
+            error and may treat this turn as a failed generation.
+    """
+    matches = _TOOL_CALL_PATTERN.findall(model_output)
+
+    if not matches:
         return None
-    raw_payload = _strip_code_fences(match.group(1))
+
+    if len(matches) > 1:
+        msg = f"Multiple <tool_call> blocks found ({len(matches)}); emit exactly one per turn."
+        logger.warning(msg)
+        return {"ok": False, "call": None, "error": msg}
+
+    raw_payload = _strip_code_fences(matches[0])
     json_payload = _extract_balanced_json(raw_payload) or raw_payload
+
     try:
         payload = json.loads(json_payload)
-    except json.JSONDecodeError:
-        logger.warning("Unable to decode tool call payload: %s", raw_payload)
-        return None
+    except json.JSONDecodeError as exc:
+        msg = f"JSON decode error: {exc} | raw: {raw_payload[:200]}"
+        logger.warning("Tool call JSON parse failed: %s", msg)
+        return {"ok": False, "call": None, "error": msg}
 
     name = payload.get("name")
     arguments = payload.get("arguments", {})
-    if not isinstance(name, str) or not isinstance(arguments, dict):
-        return None
-    return {"name": name, "arguments": arguments}
+
+    if not isinstance(name, str):
+        msg = f"'name' missing or not a string: {payload}"
+        return {"ok": False, "call": None, "error": msg}
+
+    if not isinstance(arguments, dict):
+        msg = f"'arguments' missing or not a dict: {payload}"
+        return {"ok": False, "call": None, "error": msg}
+
+    if name not in _ALLOWED_TOOLS:
+        msg = f"Unknown tool '{name}'. Allowed: {sorted(_ALLOWED_TOOLS)}"
+        logger.warning(msg)
+        return {"ok": False, "call": None, "error": msg}
+
+    if name == "arithmetic":
+        op = str(arguments.get("operation", ""))
+        if op not in _ARITHMETIC_OPS:
+            msg = (
+                f"arithmetic.operation '{op}' not in allowed set "
+                f"{sorted(_ARITHMETIC_OPS)}"
+            )
+            return {"ok": False, "call": None, "error": msg}
+
+    return {"ok": True, "call": {"name": name, "arguments": arguments}, "error": None}
 
 
 class ToolRouter:
@@ -96,9 +142,10 @@ class ToolRouter:
     def parse_action(self, text: str) -> Optional[tuple[str, str]]:
         """Return a legacy action tuple when a tool call is present."""
         parsed = parse_tool_call_from_output(text)
-        if parsed is None:
+        if parsed is None or not parsed.get("ok"):
             return None
-        return parsed["name"], json.dumps(parsed["arguments"])
+        call = parsed["call"]
+        return call["name"], json.dumps(call["arguments"])
 
     def execute(self, tool_name: str, args_str: str) -> str:
         """Execute a tool using a JSON argument string."""

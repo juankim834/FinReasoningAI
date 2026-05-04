@@ -6,6 +6,9 @@ from typing import Any
 
 from tools.number_parser import extract_number
 
+# Benchmark tool set: arithmetic + compound_growth_rate only.
+# calculate_financial_ratio and parse_percentage are removed to reduce
+# ambiguity (ratio = divide, parse_percentage adds unnecessary extra calls).
 FINANCIAL_TOOLS = [
     {
         "type": "function",
@@ -19,47 +22,20 @@ FINANCIAL_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "a": {"type": "number", "description": "First operand"},
-                    "b": {"type": "number", "description": "Second operand"},
+                    "a": {"type": "number", "description": "First operand (new/later value for percent_change)"},
+                    "b": {"type": "number", "description": "Second operand (old/earlier value for percent_change)"},
                     "operation": {
                         "type": "string",
+                        "enum": ["add", "subtract", "multiply", "divide", "percent_change"],
                         "description": (
-                            "One of: add | subtract | multiply | divide | percent_change. "
-                            "percent_change computes (a - b) / |b|."
+                            "Operation to perform. "
+                            "add: a+b. subtract: a-b. multiply: a*b. divide: a/b. "
+                            "percent_change: (a-b)/|b| where a is the new/later value "
+                            "and b is the old/earlier value."
                         ),
                     },
                 },
                 "required": ["a", "b", "operation"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "calculate_financial_ratio",
-            "description": "Compute a standard financial ratio from two numeric values.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "numerator": {"type": "number", "description": "The numerator value"},
-                    "denominator": {"type": "number", "description": "The denominator value"},
-                    "ratio_name": {"type": "string", "description": "E.g. 'P/E ratio', 'gross margin'"},
-                },
-                "required": ["numerator", "denominator", "ratio_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "parse_percentage",
-            "description": "Parse and normalize a percentage string to a float.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "value_str": {"type": "string", "description": "E.g. '12.5%' or '0.125'"},
-                },
-                "required": ["value_str"],
             },
         },
     },
@@ -71,9 +47,9 @@ FINANCIAL_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "start_value": {"type": "number"},
-                    "end_value": {"type": "number"},
-                    "n_periods": {"type": "number"},
+                    "start_value": {"type": "number", "description": "Starting value (must be > 0)"},
+                    "end_value": {"type": "number", "description": "Ending value (must be >= 0)"},
+                    "n_periods": {"type": "number", "description": "Number of periods (must be > 0)"},
                 },
                 "required": ["start_value", "end_value", "n_periods"],
             },
@@ -161,10 +137,10 @@ def compound_growth_rate(start_value: float, end_value: float, n_periods: float)
     return {"result": result, "explanation": explanation}
 
 
+# Only the two benchmark tools are in the active registry.
+# The full implementations are kept below for potential future use.
 TOOL_REGISTRY = {
     "arithmetic": arithmetic,
-    "calculate_financial_ratio": calculate_financial_ratio,
-    "parse_percentage": parse_percentage,
     "compound_growth_rate": compound_growth_rate,
 }
 

@@ -30,18 +30,33 @@ COT_SYSTEM_PROMPT = (
 )
 
 _TOOL_PROMPT_INTRO = (
-    "You have access to calculation tools. "
-    "For EVERY numeric computation — subtraction, division, multiplication, "
-    "percentage change, ratio, or growth rate — you MUST call a tool. "
+    "You are solving a financial QA problem using tools.\n\n"
+    "For this benchmark, every question requires numeric computation. "
+    "You MUST call at least one tool before giving the final answer.\n\n"
+    "For EVERY numeric computation — addition, subtraction, division, multiplication, "
+    "percentage change, ratio, growth rate, or CAGR — you MUST call a tool. "
     "Do NOT compute numbers in your head.\n\n"
-    "To call a tool emit exactly ONE JSON block inside tags (one call per turn):\n"
-    '  <tool_call>{"name": "<tool_name>", "arguments": {...}}</tool_call>\n\n'
-    "Available tools:\n"
-    "  • arithmetic(a, b, operation)  — add | subtract | multiply | divide | percent_change\n"
-    "  • calculate_financial_ratio(numerator, denominator, ratio_name)\n"
-    "  • parse_percentage(value_str)  — normalize a percentage string to a decimal\n"
-    "  • compound_growth_rate(start_value, end_value, n_periods)  — CAGR\n\n"
-    "After all tool calls are done, write your final answer on a line starting with 'Answer:'."
+    "Tool-call format:\n"
+    "Emit exactly ONE JSON object inside <tool_call> tags, and nothing else in that assistant turn.\n\n"
+    "Use this exact format:\n"
+    '<tool_call>{"name":"arithmetic","arguments":{"a":120.0,"b":100.0,"operation":"subtract"}}</tool_call>\n\n'
+    "If multiple computations are needed, call one tool, wait for the tool result, "
+    "then call the next tool. Never emit multiple tool calls in one turn.\n\n"
+    "Available tools:\n\n"
+    "1. arithmetic(a, b, operation)\n"
+    "   operation must be one of: add, subtract, multiply, divide, percent_change.\n"
+    "   add computes a + b.\n"
+    "   subtract computes a - b.\n"
+    "   multiply computes a * b.\n"
+    "   divide computes a / b.\n"
+    "   percent_change computes (a - b) / abs(b), where a is the later/new/current value "
+    "and b is the earlier/old/previous value.\n\n"
+    "2. compound_growth_rate(start_value, end_value, n_periods)\n"
+    "   Computes CAGR = (end_value / start_value) ** (1 / n_periods) - 1.\n\n"
+    "After all required tool calls are done, output exactly one line:\n"
+    "Final Answer: <number only>\n\n"
+    "Do not include units, explanation, formulas, commas, currency symbols, "
+    "percentage signs, or extra text after the final answer."
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -52,6 +67,11 @@ _NUMBER_RE = re.compile(
 _REFUSAL_RE = re.compile(
     r"(insufficient information|cannot determine|not enough information|unable to answer)",
     re.IGNORECASE,
+)
+# Strict parser: matches the last "Final Answer: <bare number>" line.
+_FINAL_ANSWER_RE = re.compile(
+    r"^\s*Final\s+Answer:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 INSUFFICIENT_INFO_RESPONSE = "Insufficient information."
 
@@ -262,6 +282,27 @@ def extract_answer_from_cot_output(raw_output: str) -> str:
 
 
 
+def extract_final_answer(text: str) -> tuple[Optional[str], bool]:
+    """Extract a strict 'Final Answer: <number>' line from model output.
+
+    Scans for the *last* line matching the pattern so that intermediate
+    tool-call turns don't shadow the real answer.
+
+    Returns:
+        ``(answer_str, False)``  — strict match found; ``answer_str`` is the
+            raw numeric string (e.g. ``"20.0"``).
+        ``(fallback_str, True)`` — no strict match; ``fallback_str`` is the
+            result of the legacy CoT extractor (may be ``None``).
+            ``parse_failed=True`` is recorded for benchmark diagnostics.
+    """
+    matches = list(_FINAL_ANSWER_RE.finditer(text))
+    if matches:
+        return matches[-1].group(1), False
+    fallback = extract_answer_from_cot_output(text) or None
+    return fallback, True
+
+
+
 def check_grounding(answer: str, context: str, tol: float = 0.02) -> bool:
     """Lightweight wrapper around evaluation grounding checks."""
     from src.eval.evaluate import compute_grounding_rate
@@ -356,15 +397,22 @@ def generate_with_tools(
     context: str = "",
     tools: list[dict[str, Any]] = FINANCIAL_TOOLS,
     max_new_tokens: int = 512,
-    max_tool_rounds: int = 3,
+    max_tool_rounds: int = 6,
 ) -> dict[str, Any]:
-    """Run a simple tool-augmented reasoning loop and return the final answer."""
-    messages = _build_messages(question=question, context=context, use_cot=True, use_tools=True, tools=tools)
+    """Run a strict tool-augmented reasoning loop and return the final answer.
+
+    Does NOT pass ``tools`` to the chat template to avoid Qwen's native
+    tool-call schema overriding the custom ``<tool_call>`` system prompt.
+    Tool instructions are injected via ``_TOOL_PROMPT_INTRO`` instead.
+    """
+    del tools  # tool list is described in the system prompt; not passed to template
+    messages = _build_messages(question=question, context=context, use_cot=True, use_tools=True)
     tool_calls: list[dict[str, Any]] = []
-    full_output = ""
+    full_outputs: list[str] = []
 
     for _ in range(max_tool_rounds + 1):
-        prompt = _apply_chat_template(tokenizer, messages, tools=tools)
+        # Omit tools= so Qwen's template does not inject a conflicting schema.
+        prompt = _apply_chat_template(tokenizer, messages)
         raw_output = _generate_once(
             model,
             tokenizer,
@@ -374,27 +422,53 @@ def generate_with_tools(
             top_p=0.9,
             question=question,
         )
-        full_output = raw_output
-        parsed_call = parse_tool_call_from_output(raw_output)
-        if parsed_call is None:
-            answer = extract_answer_from_cot_output(raw_output)
-            return {"answer": answer, "tool_calls": tool_calls, "full_output": raw_output}
+        full_outputs.append(raw_output)
 
-        tool_result = dispatch_tool_call(parsed_call["name"], parsed_call["arguments"])
-        tool_calls.append({
-            "name": parsed_call["name"],
-            "arguments": parsed_call["arguments"],
-            "result": tool_result,
-        })
+        parsed = parse_tool_call_from_output(raw_output)
+
+        if parsed is None:
+            # No tool_call block — model is emitting its final answer.
+            answer, _ = extract_final_answer(raw_output)
+            return {
+                "answer": answer,
+                "tool_calls": tool_calls,
+                "n_rounds": len(tool_calls),
+                "full_output": "\n\n---\n\n".join(full_outputs),
+                "tool_violation": len(tool_calls) == 0,
+                "max_rounds_exceeded": False,
+            }
+
+        if not parsed["ok"]:
+            logger.warning("Malformed tool call: %s", parsed["error"])
+            answer, _ = extract_final_answer(raw_output)
+            return {
+                "answer": answer,
+                "tool_calls": tool_calls,
+                "n_rounds": len(tool_calls),
+                "full_output": "\n\n---\n\n".join(full_outputs),
+                "tool_violation": len(tool_calls) == 0,
+                "max_rounds_exceeded": False,
+            }
+
+        call = parsed["call"]
+        tool_result = dispatch_tool_call(call["name"], call["arguments"])
+        tool_calls.append({"name": call["name"], "arguments": call["arguments"], "result": tool_result})
         messages.append({"role": "assistant", "content": raw_output})
         messages.append({
             "role": "tool",
-            "name": parsed_call["name"],
+            "name": call["name"],
             "content": json.dumps(tool_result, ensure_ascii=False),
         })
 
-    answer = extract_answer_from_cot_output(full_output)
-    return {"answer": answer, "tool_calls": tool_calls, "full_output": full_output}
+    answer, _ = extract_final_answer(full_outputs[-1])
+    return {
+        "answer": answer,
+        "tool_calls": tool_calls,
+        "n_rounds": len(tool_calls),
+        "full_output": "\n\n---\n\n".join(full_outputs),
+        "tool_violation": len(tool_calls) == 0,
+        "max_rounds_exceeded": True,
+    }
 
 
 
@@ -425,10 +499,9 @@ def generate_answer(
             tokenizer,
             question=question,
             context=context,
-            tools=FINANCIAL_TOOLS,
             max_new_tokens=max_new_tokens,
         )
-        answer = postprocess_answer(tool_result["answer"])
+        answer = postprocess_answer(tool_result["answer"] or "")
     elif self_consistency_n > 1:
         if tokenizer is None:
             raise ValueError("tokenizer is required for self-consistency generation.")
