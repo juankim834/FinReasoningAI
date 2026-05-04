@@ -248,7 +248,7 @@ def _tokenize_old_trl_dataset(
     dataset: Any,
     tokenizer: AutoTokenizer,
     max_seq_length: int,
-    max_train_length: int = 4096,
+    max_train_length: int = 16384,
 ) -> Any:
     """
     Tokenize text examples for the legacy TRL/Trainer path.
@@ -318,7 +318,7 @@ def main(
     gradient_checkpointing: bool = True,
     learning_rate: float = 2e-4,
     max_seq_length: int = 2048,
-    max_train_length: int = 4096,
+    max_train_length: int = 16384,
     lora_r: int = 64,
     lora_alpha: int = 128,
     lora_dropout: float = 0.05,
@@ -450,7 +450,7 @@ if __name__ == "__main__":
                         help="Disable gradient checkpointing (trades memory for speed)")
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--max_seq_length", type=int, default=2048)
-    parser.add_argument("--max_train_length", type=int, default=4096,
+    parser.add_argument("--max_train_length", type=int, default=16384,
                         help="Hard-drop samples longer than this many tokens before training.")
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=128)

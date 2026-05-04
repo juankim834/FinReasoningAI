@@ -283,9 +283,15 @@ def _validate_eval_samples(samples: List[dict], n: int = 5) -> None:
     """
     Validate the first ``n`` samples before running inference.
 
-    Raises:
-        ValueError: with guidance to re-run ``load_eval_test_samples`` if required
-        fields are missing or empty.
+    Hard-fails only when ``question`` or ``answer`` is absent (eval is impossible
+    without them).  Missing ``context`` and ``expression`` are logged as warnings
+    because the downstream metric helpers degrade gracefully:
+
+    - ``compute_grounding_rate`` returns 1.0/0.5 when context is empty.
+    - Expression-based grounding returns 0.5 when ``expression`` is absent.
+
+    ``financial_data`` is accepted as a stand-in for ``context`` for any task
+    (not only ``structured_analysis``).
     """
     hint = (
         "Re-run `load_eval_test_samples` from your raw JSONL path so each row "
@@ -305,19 +311,21 @@ def _validate_eval_samples(samples: List[dict], n: int = 5) -> None:
             (isinstance(ctx_val, str) and ctx_val.strip() != "")
             or (not isinstance(ctx_val, str) and ctx_val != "")
         )
+        if not has_context and sample.get("financial_data"):
+            has_context = True
         if not has_context:
-            if task == "structured_analysis" and sample.get("financial_data"):
-                has_context = True
-        if not has_context:
-            raise ValueError(
-                f"Sample id={sid!r} is missing or has empty 'context' "
-                f"(for structured_analysis, provide non-empty 'financial_data' if context is absent). {hint}"
+            logger.warning(
+                "Sample id=%r (task=%r) has no 'context' or 'financial_data'. "
+                "Grounding metrics will be approximate for this sample.",
+                sid, task,
             )
         if task in ("numerical_reasoning", "structured_analysis"):
             expr = sample.get("expression")
             if expr is None or (isinstance(expr, str) and not str(expr).strip()):
-                raise ValueError(
-                    f"Sample id={sid!r} (task={task!r}) requires non-empty 'expression'. {hint}"
+                logger.warning(
+                    "Sample id=%r (task=%r) has no 'expression'. "
+                    "Expression-based grounding will return 0.5 for this sample.",
+                    sid, task,
                 )
 
 
@@ -639,6 +647,24 @@ def evaluate_model(
         samples = test_dataset.to_list()
     else:
         samples = list(test_dataset)
+
+    # Normalise fields so downstream metric code always sees consistent keys.
+    normalised = []
+    for i, s in enumerate(samples):
+        s = dict(s)
+        # Ensure a stable id for error messages.
+        if not s.get("id"):
+            s["id"] = f"index_{i}"
+        # Promote financial_data → context when context is absent or empty.
+        ctx = s.get("context")
+        ctx_empty = ctx is None or (isinstance(ctx, str) and not ctx.strip())
+        if ctx_empty and s.get("financial_data"):
+            s["context"] = s["financial_data"]
+        # Default task so validators and grounding helpers always have a value.
+        if not s.get("task"):
+            s["task"] = "financial_qa"
+        normalised.append(s)
+    samples = normalised
 
     _validate_eval_samples(samples)
 
