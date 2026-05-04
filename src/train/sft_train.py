@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 DEFAULT_OUTPUT_DIR = "outputs/sft_qlora"
-DEFAULT_DATA_DIR = "data/processed"
-RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
+DEFAULT_DATA_DIR = "data/processed_fincot_sft"
+RESPONSE_TEMPLATE = "\n\n### Response:\n"
 
 
 def _parse_version(version: str) -> tuple[int, ...]:
@@ -166,7 +166,7 @@ def _prepare_old_trl_dataset(dataset: Any) -> Any:
         return dataset
 
     def add_text(example: dict[str, Any]) -> dict[str, str]:
-        return {"text": f"{example['prompt']}{example['completion']}"}
+        return {"text": f"{example['prompt']}{RESPONSE_TEMPLATE}{example['completion']}"}
 
     text_dataset = dataset.map(add_text)
     keep_columns = ["text"]
@@ -237,7 +237,7 @@ def main(
 
     dataset = load_datasets(data_dir)
     train_dataset = dataset["train"]
-    eval_dataset = dataset.get("val") or dataset.get("validation")
+    eval_dataset = dataset.get("val") or dataset.get("validation") or dataset.get("test")
     training_args = build_training_arguments(
         output_dir=output_dir,
         num_train_epochs=num_train_epochs,

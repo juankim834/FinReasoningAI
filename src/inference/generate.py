@@ -162,8 +162,8 @@ def safe_calculate(expression: str) -> float | str:
 
 def _tool_system_prompt(tools: Optional[list[dict[str, Any]]]) -> str:
     """Build the system prompt used for tool-augmented inference."""
-    tool_block = json.dumps(tools or FINANCIAL_TOOLS, indent=2, ensure_ascii=False)
-    return f"{COT_SYSTEM_PROMPT}\n\n{_TOOL_PROMPT_INTRO}\n\n## Available Tools\n{tool_block}"
+    del tools
+    return f"{COT_SYSTEM_PROMPT}\n\n{_TOOL_PROMPT_INTRO}"
 
 
 

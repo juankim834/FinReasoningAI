@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 from importlib import import_module
 import logging
+from pathlib import Path
 from typing import Any, Tuple
 
 import torch
@@ -222,6 +223,30 @@ def load_vllm_model_and_tokenizer(
         enable_lora=enable_lora,
         **llm_kwargs,
     )
+    return model, tokenizer
+
+
+def load_model_with_adapter(
+    model_id: str = DEFAULT_MODEL_ID,
+    adapter_dir: str | None = None,
+    *,
+    bnb_config: BitsAndBytesConfig | None = None,
+    device_map: str = "auto",
+    trust_remote_code: bool = True,
+    attn_implementation: str = "flash_attention_2",
+) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """Load a base model and optionally attach a PEFT adapter."""
+    model, tokenizer = load_model_and_tokenizer(
+        model_id=model_id,
+        bnb_config=bnb_config,
+        device_map=device_map,
+        trust_remote_code=trust_remote_code,
+        attn_implementation=attn_implementation,
+    )
+    if adapter_dir and Path(adapter_dir).exists():
+        PeftModel = import_module("peft").PeftModel
+        model = PeftModel.from_pretrained(model, adapter_dir)
+        logger.info("Loaded adapter from %s", adapter_dir)
     return model, tokenizer
 
 

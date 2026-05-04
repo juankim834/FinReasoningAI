@@ -732,7 +732,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_id", default="Qwen/Qwen2.5-14B-Instruct")
     parser.add_argument("--adapter_dir", default="outputs/sft_qlora/final_adapter",
                         help="Path to LoRA adapter (or 'none' to use base model)")
-    parser.add_argument("--test_data", default="data/processed",
+    parser.add_argument("--test_data", default="data/processed_fincot_sft",
                         help="Path to preprocessed DatasetDict or raw JSONL")
     parser.add_argument("--output_csv", default="outputs/eval_results.csv")
     parser.add_argument("--max_samples", type=int, default=None)

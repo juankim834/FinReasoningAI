@@ -15,8 +15,8 @@ include/
 .flaskenv
 *.local
 
-# data/
-# models/
+data/
+models/
 *.pt
 *.pth
 *.bin

@@ -11,7 +11,49 @@ from tools.financial_tools import TOOL_REGISTRY
 
 logger = logging.getLogger(__name__)
 
-_TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove optional markdown code fences around JSON payloads."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def _extract_balanced_json(text: str) -> Optional[str]:
+    """
+    Extract the first balanced JSON object from arbitrary tool-call text.
+
+    This handles cases where the model adds commentary before or after the JSON.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
 
 
 def dispatch_tool_call(tool_name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
@@ -33,10 +75,12 @@ def parse_tool_call_from_output(model_output: str) -> Optional[dict[str, Any]]:
     match = _TOOL_CALL_PATTERN.search(model_output)
     if not match:
         return None
+    raw_payload = _strip_code_fences(match.group(1))
+    json_payload = _extract_balanced_json(raw_payload) or raw_payload
     try:
-        payload = json.loads(match.group(1))
+        payload = json.loads(json_payload)
     except json.JSONDecodeError:
-        logger.warning("Unable to decode tool call payload: %s", match.group(1))
+        logger.warning("Unable to decode tool call payload: %s", raw_payload)
         return None
 
     name = payload.get("name")

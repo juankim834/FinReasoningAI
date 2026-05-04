@@ -1,112 +1,164 @@
-"""Load and normalize FinCoT-style financial reasoning datasets."""
+"""Load and classify FinCoT SFT samples from Hugging Face."""
 
 from __future__ import annotations
 
 import json
 import logging
-import random
+import re
 from collections import Counter
-from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-PRIMARY_DATASETS = (
-    "Duxiaoman-DI/FinCoT",
-    "IDEA-FinAI/fingpt-forecasting",
-    "gbharti/finance-alpaca",
-)
-
-TASK_LABELS = ("financial_qa", "numerical_reasoning", "structured_analysis")
-FINANCE_KEYWORDS = (
-    "finance",
-    "financial",
-    "revenue",
-    "income",
-    "earnings",
-    "profit",
-    "loss",
-    "cash flow",
-    "balance sheet",
-    "market cap",
-    "stock",
-    "equity",
-    "debt",
-    "asset",
-    "liability",
-    "margin",
-    "ratio",
-    "valuation",
-    "ebitda",
-    "guidance",
-    "forecast",
-    "dividend",
-    "returns",
-    "investment",
-    "quarter",
-    "fiscal",
-)
-CODE_MARKERS = (
-    "def ",
-    "return ",
-    "for ",
-    "while ",
-    "class ",
-    "import ",
-    "print(",
-    "```",
-)
-
-
-def _stringify(value: Any) -> str:
-    """Convert any dataset value into a trimmed string."""
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    return str(value).strip()
-
+DATASET_NAME = "TheFinAI/FinCoT"
+PREFERRED_SFT_SPLITS = ("SFT Training", "SFT")
+NUMERICAL_REASONING = "Numerical Reasoning"
+NON_NUMERICAL_REASONING = "Non-Numerical Reasoning"
 
 QUESTION_KEYS = (
     "question",
+    "Question",
     "instruction",
+    "Instruction",
     "input",
+    "Input",
     "query",
     "prompt",
 )
 ANSWER_KEYS = (
     "answer",
+    "Answer",
+    "Final_response",
+    "final_response",
     "output",
+    "Output",
     "response",
-    "label",
-    "target",
 )
-COT_KEYS = (
+REASONING_KEYS = (
+    "reasoning",
+    "Reasoning",
+    "Reasoning_process",
+    "reasoning_process",
     "chain_of_thought",
     "cot",
-    "reasoning",
     "analysis",
-    "thought",
     "rationale",
 )
 CONTEXT_KEYS = (
     "context",
-    "input_context",
+    "Context",
     "document",
+    "Document",
     "passage",
     "news",
-    "instruction_context",
 )
-TASK_KEYS = (
-    "task",
+EXPLICIT_REASONING_TYPE_KEYS = (
+    "reasoning_category",
+    "reasoning_type",
+    "reasoning_kind",
+    "reasoning_task",
     "task_type",
+    "task",
     "category",
     "type",
 )
 
+NUMERICAL_VALUE_HINTS = (
+    "numerical",
+    "quantitative",
+    "calculation",
+    "math",
+    "arithmetic",
+    "ratio",
+    "percentage",
+    "growth",
+)
+NON_NUMERICAL_VALUE_HINTS = (
+    "non-numerical",
+    "non numerical",
+    "qualitative",
+    "textual",
+    "descriptive",
+    "sentiment",
+    "summarization",
+    "classification",
+)
+NUMERICAL_KEYWORDS = (
+    "calculate",
+    "calculation",
+    "compute",
+    "what is the percentage",
+    "percentage",
+    "percent",
+    "ratio",
+    "growth rate",
+    "cagr",
+    "compound annual growth",
+    "basis points",
+    "bps",
+    "increase",
+    "decrease",
+    "gross margin",
+    "operating margin",
+    "net margin",
+    "return on assets",
+    "return on equity",
+    "eps",
+    "earnings per share",
+    "price-to-earnings",
+    "p/e",
+    "dividend yield",
+    "current ratio",
+    "quick ratio",
+    "debt-to-equity",
+    "free cash flow",
+    "present value",
+    "future value",
+    "discount rate",
+    "annualized",
+    "weighted average",
+    "sum of",
+    "total of",
+)
+NON_NUMERICAL_KEYWORDS = (
+    "summarize",
+    "summary",
+    "explain qualitatively",
+    "qualitative",
+    "describe",
+    "discuss",
+    "interpret the statement",
+    "what does this mean",
+    "identify the risk",
+    "sentiment",
+)
+TABLE_HINTS = ("|", "\t", "fiscal year", "years ended", "three months ended")
+MONEY_OR_UNIT_PATTERN = re.compile(
+    r"(?:\$|usd|eur|million|billion|thousand|%|percent|basis points|bps)",
+    re.IGNORECASE,
+)
+NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])[-+]?\d[\d,]*(?:\.\d+)?")
+ARITHMETIC_PATTERN = re.compile(r"[\d\)\]]\s*[-+/*=]\s*[\d\(\[]")
+
+
+def _stringify(value: Any) -> str:
+    """Convert a dataset value into a readable string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_stringify(item) for item in value if _stringify(item))
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            return str(value).strip()
+    return str(value).strip()
+
 
 def _first_present(sample: dict[str, Any], keys: Iterable[str]) -> str:
-    """Return the first non-empty string value found for the provided keys."""
+    """Return the first non-empty string from the provided keys."""
     for key in keys:
         value = _stringify(sample.get(key))
         if value:
@@ -114,156 +166,183 @@ def _first_present(sample: dict[str, Any], keys: Iterable[str]) -> str:
     return ""
 
 
-def _infer_task(question: str, answer: str, chain_of_thought: str, context: str) -> str:
-    """Infer one of the supported task labels from sample content."""
-    blob = " ".join(part.lower() for part in (question, answer, chain_of_thought, context) if part)
-    numerical_markers = (
-        "calculate",
-        "ratio",
-        "margin",
-        "growth rate",
-        "cagr",
-        "percentage",
-        "basis points",
-        "bps",
+def _extract_messages_text(messages: Any) -> str:
+    """Flatten conversational message content into plain text for heuristics."""
+    if not isinstance(messages, list):
+        return ""
+
+    chunks: list[str] = []
+    for item in messages:
+        if isinstance(item, dict):
+            for key in ("content", "text", "value"):
+                value = _stringify(item.get(key))
+                if value:
+                    chunks.append(value)
+                    break
+        else:
+            value = _stringify(item)
+            if value:
+                chunks.append(value)
+    return "\n".join(chunks)
+
+
+def _resolve_sft_split(split_names: Iterable[str]) -> str:
+    """Resolve the preferred FinCoT SFT split name."""
+    split_list = list(split_names)
+    normalized = {name.casefold(): name for name in split_list}
+
+    for preferred in PREFERRED_SFT_SPLITS:
+        if preferred.casefold() in normalized:
+            return normalized[preferred.casefold()]
+
+    for name in split_list:
+        if "sft" in name.casefold():
+            return name
+
+    raise ValueError(
+        f"Unable to find an SFT split in {split_list}. "
+        f"Expected one of {list(PREFERRED_SFT_SPLITS)}."
     )
-    structured_markers = (
-        "table",
-        "json",
-        "balance sheet",
-        "income statement",
-        "cash flow",
-        "financial data",
-    )
-    if any(marker in blob for marker in numerical_markers):
-        return "numerical_reasoning"
-    if any(marker in blob for marker in structured_markers):
-        return "structured_analysis"
-    return "financial_qa"
 
 
 def _normalize_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a raw sample from any supported source."""
-    question = _first_present(sample, QUESTION_KEYS)
-    answer = _first_present(sample, ANSWER_KEYS)
-    chain_of_thought = _first_present(sample, COT_KEYS)
-    context = _first_present(sample, CONTEXT_KEYS)
-    task = _first_present(sample, TASK_KEYS).lower().replace(" ", "_")
-    if task not in TASK_LABELS:
-        task = _infer_task(question, answer, chain_of_thought, context)
+    """Attach canonical fields while preserving the original sample fields."""
+    normalized = dict(sample)
+    normalized["question"] = _first_present(sample, QUESTION_KEYS)
+    normalized["answer"] = _first_present(sample, ANSWER_KEYS)
+    normalized["reasoning"] = _first_present(sample, REASONING_KEYS)
+    normalized["context"] = _first_present(sample, CONTEXT_KEYS)
 
-    if not question or not answer:
-        raise ValueError("Sample is missing a question or answer after normalization.")
+    if not normalized["question"]:
+        messages_text = _extract_messages_text(sample.get("messages"))
+        if messages_text:
+            normalized["question"] = messages_text
 
-    return {
-        "question": question,
-        "answer": answer,
-        "chain_of_thought": chain_of_thought,
-        "context": context or None,
-        "task": task,
-    }
-
-
-def _looks_like_code(text: str) -> bool:
-    """Return True when a string looks like source code rather than an answer."""
-    stripped = text.strip()
-    return any(marker in stripped for marker in CODE_MARKERS)
-
-
-def _is_financial_sample(sample: dict[str, Any]) -> bool:
-    """Filter out obviously off-domain rows such as generic coding tasks."""
-    blob = " ".join(
-        part.lower()
-        for part in (
-            sample.get("question", ""),
-            sample.get("answer", ""),
-            sample.get("chain_of_thought", ""),
-            sample.get("context", "") or "",
-        )
-        if part
-    )
-    if not blob:
-        return False
-    if _looks_like_code(sample.get("answer", "")) or _looks_like_code(sample.get("question", "")):
-        return False
-    return any(keyword in blob for keyword in FINANCE_KEYWORDS)
-
-
-def _load_huggingface_rows() -> tuple[list[dict[str, Any]], str]:
-    """Try candidate Hugging Face datasets in priority order."""
-    from datasets import load_dataset
-
-    last_error: Exception | None = None
-    for dataset_name in PRIMARY_DATASETS:
-        try:
-            dataset = load_dataset(dataset_name)
-            logger.info("Loaded dataset from Hugging Face: %s", dataset_name)
-            rows: list[dict[str, Any]] = []
-            for split in dataset.values():
-                rows.extend(split.to_list())
-            return rows, dataset_name
-        except Exception as exc:  # pragma: no cover - depends on external availability
-            last_error = exc
-            logger.warning("Failed to load dataset %s: %s", dataset_name, exc)
-    raise RuntimeError("Unable to load a supported FinCoT dataset from Hugging Face.") from last_error
-
-
-def _load_local_rows(local_path: str) -> list[dict[str, Any]]:
-    """Load JSONL rows from a local FinCoT export."""
-    path = Path(local_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Local dataset not found: {local_path}")
-
-    rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                logger.warning("Skipping malformed JSONL line %d: %s", line_number, exc)
-    return rows
-
-
-def load_fincot_samples(
-    source: str = "huggingface",
-    local_path: str = "data/raw/fincot.jsonl",
-    max_samples: Optional[int] = None,
-    seed: int = 42,
-) -> list[dict[str, Any]]:
-    """Load FinCoT-style samples and normalize them to a common schema."""
-    source = source.lower()
-    if source not in {"huggingface", "local"}:
-        raise ValueError("source must be either 'huggingface' or 'local'.")
-
-    if source == "huggingface":
-        raw_rows, source_name = _load_huggingface_rows()
-    else:
-        raw_rows = _load_local_rows(local_path)
-        source_name = local_path
-
-    normalized: list[dict[str, Any]] = []
-    for row in raw_rows:
-        try:
-            sample = _normalize_sample(row)
-            if _is_financial_sample(sample):
-                normalized.append(sample)
-        except ValueError as exc:
-            logger.debug("Skipping unusable row: %s", exc)
-
-    rng = random.Random(seed)
-    rng.shuffle(normalized)
-    if max_samples is not None:
-        normalized = normalized[:max_samples]
-
-    task_counts = Counter(sample["task"] for sample in normalized)
-    summary = ", ".join(f"{task}={count}" for task, count in sorted(task_counts.items()))
-    print(f"Dataset source: {source_name}")
-    print(f"Loaded {len(normalized)} FinCoT samples.")
-    print(f"Task distribution: {summary}")
     return normalized
 
 
-__all__ = ["load_fincot_samples"]
+def _classify_from_explicit_field(sample: dict[str, Any]) -> str | None:
+    """Use an explicit task/category field when it clearly maps to a category."""
+    for key in EXPLICIT_REASONING_TYPE_KEYS:
+        raw_value = _stringify(sample.get(key))
+        if not raw_value:
+            continue
+
+        value = raw_value.casefold()
+        if any(hint in value for hint in NUMERICAL_VALUE_HINTS):
+            return NUMERICAL_REASONING
+        if any(hint in value for hint in NON_NUMERICAL_VALUE_HINTS):
+            return NON_NUMERICAL_REASONING
+    return None
+
+
+def classify_reasoning_category(sample: dict[str, Any]) -> str:
+    """
+    Classify a sample as numerical vs non-numerical reasoning.
+
+    The function first checks for an explicit dataset field such as `task_type`
+    or `category`. If the dataset does not expose a usable label, it falls back
+    to a score-based heuristic over question/context/reasoning/answer text.
+    """
+    explicit_category = _classify_from_explicit_field(sample)
+    if explicit_category is not None:
+        return explicit_category
+
+    text_parts = [
+        _stringify(sample.get("question")),
+        _stringify(sample.get("context")),
+        _stringify(sample.get("reasoning")),
+        _stringify(sample.get("answer")),
+        _extract_messages_text(sample.get("messages")),
+    ]
+    text = "\n".join(part for part in text_parts if part)
+    lowered = text.casefold()
+
+    score = 0
+
+    number_matches = NUMBER_PATTERN.findall(text)
+    if len(number_matches) >= 4:
+        score += 2
+    elif len(number_matches) >= 2:
+        score += 1
+
+    if ARITHMETIC_PATTERN.search(text):
+        score += 3
+
+    unit_matches = MONEY_OR_UNIT_PATTERN.findall(lowered)
+    if len(unit_matches) >= 2:
+        score += 2
+    elif unit_matches:
+        score += 1
+
+    if sum(1 for keyword in NUMERICAL_KEYWORDS if keyword in lowered) >= 2:
+        score += 2
+    elif any(keyword in lowered for keyword in NUMERICAL_KEYWORDS):
+        score += 1
+
+    if any(marker in lowered for marker in TABLE_HINTS) and len(number_matches) >= 3:
+        score += 2
+
+    if "step 1" in lowered or "first," in lowered or "then," in lowered:
+        if len(number_matches) >= 2:
+            score += 1
+
+    if any(keyword in lowered for keyword in NON_NUMERICAL_KEYWORDS) and score < 3:
+        score -= 1
+
+    return NUMERICAL_REASONING if score >= 3 else NON_NUMERICAL_REASONING
+
+
+def load_fincot_sft_split(
+    dataset_name: str = DATASET_NAME,
+) -> tuple[Any, str, list[str]]:
+    """Load the FinCoT SFT split and return the dataset, split name, and columns."""
+    from datasets import load_dataset
+
+    dataset_dict = load_dataset(dataset_name)
+    split_name = _resolve_sft_split(dataset_dict.keys())
+    dataset = dataset_dict[split_name]
+    columns = list(dataset.column_names)
+    return dataset, split_name, columns
+
+
+def load_fincot_samples(
+    dataset_name: str = DATASET_NAME,
+    max_samples: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load FinCoT SFT samples, preserve original fields, and add canonical ones."""
+    dataset, split_name, columns = load_fincot_sft_split(dataset_name=dataset_name)
+    raw_rows = dataset.to_list()
+    normalized_rows = [_normalize_sample(row) for row in raw_rows]
+    if max_samples is not None:
+        normalized_rows = normalized_rows[:max_samples]
+
+    metadata = {
+        "dataset_name": dataset_name,
+        "split_name": split_name,
+        "columns": columns,
+        "original_sample_count": len(raw_rows),
+    }
+    logger.info(
+        "Loaded %d rows from %s split '%s'.",
+        len(normalized_rows),
+        dataset_name,
+        split_name,
+    )
+    return normalized_rows, metadata
+
+
+def summarize_reasoning_categories(samples: list[dict[str, Any]]) -> Counter[str]:
+    """Count reasoning categories in a sample list."""
+    return Counter(str(sample.get("reasoning_category", "")) for sample in samples)
+
+
+__all__ = [
+    "DATASET_NAME",
+    "NON_NUMERICAL_REASONING",
+    "NUMERICAL_REASONING",
+    "classify_reasoning_category",
+    "load_fincot_samples",
+    "load_fincot_sft_split",
+    "summarize_reasoning_categories",
+]
