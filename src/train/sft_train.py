@@ -21,6 +21,9 @@ DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 DEFAULT_OUTPUT_DIR = "outputs/sft_qlora"
 DEFAULT_DATA_DIR = "data/processed_fincot_sft"
 RESPONSE_TEMPLATE = "Answer:"
+# Minimum number of completion tokens that must remain after truncation.
+# Samples whose prompt alone would consume >= max_seq_length - this value are dropped.
+_MIN_COMPLETION_TOKENS = 32
 
 
 def _parse_version(version: str) -> tuple[int, ...]:
@@ -143,14 +146,32 @@ def load_datasets(data_dir: str = DEFAULT_DATA_DIR) -> DatasetDict:
 
 
 def _build_old_trl_collator(tokenizer: AutoTokenizer) -> Any:
-    """Build a completion-only collator for older TRL versions."""
+    """Build a completion-only collator for older TRL versions.
+
+    Root-cause fix: using "Answer:" as the response_template string is fragile
+    because DataCollatorForCompletionOnlyLM scans tokenized IDs for that
+    subsequence.  When long prompts (e.g. full tool-JSON schema + table context)
+    push the combined text close to max_seq_length, right-side truncation cuts
+    "Answer:" off before the collator ever sees it, producing the warning
+    "Could not find response key `Answer:` in the following instance".
+
+    Using the ChatML assistant-turn marker token IDs instead anchors the
+    response mask to a position that is structurally part of the *prompt*
+    (produced by apply_chat_template), so it is never affected by
+    completion-side truncation.
+    """
     if DataCollatorForCompletionOnlyLM is None:
         raise RuntimeError(
             "TRL does not provide DataCollatorForCompletionOnlyLM in this environment. "
             "Upgrade TRL or use the prompt/completion dataset path with TRL >= 0.20."
         )
+    # Encode the ChatML assistant-turn opening as a token-ID list.
+    # Everything after these tokens is treated as the response and receives loss.
+    response_template_ids = tokenizer.encode(
+        "<|im_start|>assistant\n", add_special_tokens=False
+    )
     return DataCollatorForCompletionOnlyLM(
-        response_template=RESPONSE_TEMPLATE,
+        response_template=response_template_ids,
         tokenizer=tokenizer,
         mlm=False,
     )
@@ -162,17 +183,23 @@ def _prepare_old_trl_dataset(dataset: Any) -> Any:
 
     Older SFTTrainer versions require `dataset_text_field` or `formatting_func`
     even when a custom completion-only collator is supplied.
+
+    All completions are normalised to start with "Answer:" so the model always
+    learns the response prefix, regardless of which source dataset the sample
+    came from (some external datasets use a different system-prompt style and
+    omit the "Answer:" prefix entirely).
     """
     required_columns = {"prompt", "completion"}
     if not required_columns.issubset(set(dataset.column_names)):
         return dataset
 
     def add_text(example: dict[str, Any]) -> dict[str, str]:
-        completion = str(example["completion"])
-        if completion.lstrip().startswith(RESPONSE_TEMPLATE):
-            text = f"{example['prompt']}{completion}"
-        else:
-            text = f"{example['prompt']}\n{RESPONSE_TEMPLATE} {completion}"
+        # `prompt` is produced by apply_chat_template and ends with
+        # "<|im_start|>assistant\n" (no extra newline needed here).
+        completion = str(example["completion"]).lstrip()
+        if not completion.startswith(RESPONSE_TEMPLATE):
+            completion = f"{RESPONSE_TEMPLATE} {completion}"
+        text = f"{example['prompt']}{completion}"
         return {"text": text}
 
     text_dataset = dataset.map(add_text)
@@ -188,8 +215,40 @@ def _tokenize_old_trl_dataset(dataset: Any, tokenizer: AutoTokenizer, max_seq_le
 
     This avoids relying on old SFTTrainer preprocessing behavior, which can leave
     raw string fields in the collator path and trigger tensor conversion errors.
+
+    Samples where the *prompt* alone would consume >= max_seq_length -
+    _MIN_COMPLETION_TOKENS tokens are dropped before tokenisation.  These
+    samples would have their entire completion truncated away, leaving the
+    collator nothing to compute loss on regardless of the response template.
     """
     text_dataset = _prepare_old_trl_dataset(dataset)
+
+    def _has_room(example: dict[str, Any]) -> bool:
+        """Return True when enough tokens remain for a meaningful completion.
+
+        A sample whose total tokenized length already exceeds max_seq_length
+        will be right-truncated; if the completion portion is ≤ _MIN_COMPLETION_TOKENS
+        after truncation the sample contributes nothing useful to training.
+        """
+        ids = tokenizer(
+            example["text"],
+            truncation=False,
+            add_special_tokens=False,
+        )["input_ids"]
+        if len(ids) > max_seq_length:
+            logger.warning(
+                "Dropping training sample: tokenized length %d > max_seq_length %d "
+                "(completion would be fully or nearly truncated).",
+                len(ids),
+                max_seq_length,
+            )
+            return False
+        return True
+
+    # Filter only when the dataset is small enough that per-sample tokenization
+    # is cheap; skip for very large datasets to avoid double-tokenization cost.
+    if len(text_dataset) <= 20_000:
+        text_dataset = text_dataset.filter(_has_room)
 
     def tokenize_batch(batch: dict[str, Any]) -> dict[str, Any]:
         return tokenizer(
