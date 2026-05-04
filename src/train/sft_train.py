@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"
 DEFAULT_OUTPUT_DIR = "outputs/sft_qlora"
 DEFAULT_DATA_DIR = "data/processed_fincot_sft"
-RESPONSE_TEMPLATE = "\n\n### Response:\n"
+RESPONSE_TEMPLATE = "Answer:"
 
 
 def _parse_version(version: str) -> tuple[int, ...]:
@@ -149,9 +149,8 @@ def _build_old_trl_collator(tokenizer: AutoTokenizer) -> Any:
             "TRL does not provide DataCollatorForCompletionOnlyLM in this environment. "
             "Upgrade TRL or use the prompt/completion dataset path with TRL >= 0.20."
         )
-    response_template_ids = tokenizer.encode(RESPONSE_TEMPLATE, add_special_tokens=False)
     return DataCollatorForCompletionOnlyLM(
-        response_template=response_template_ids,
+        response_template=RESPONSE_TEMPLATE,
         tokenizer=tokenizer,
         mlm=False,
     )
@@ -169,7 +168,12 @@ def _prepare_old_trl_dataset(dataset: Any) -> Any:
         return dataset
 
     def add_text(example: dict[str, Any]) -> dict[str, str]:
-        return {"text": f"{example['prompt']}{RESPONSE_TEMPLATE}{example['completion']}"}
+        completion = str(example["completion"])
+        if completion.lstrip().startswith(RESPONSE_TEMPLATE):
+            text = f"{example['prompt']}{completion}"
+        else:
+            text = f"{example['prompt']}\n{RESPONSE_TEMPLATE} {completion}"
+        return {"text": text}
 
     text_dataset = dataset.map(add_text)
     keep_columns = ["text"]
