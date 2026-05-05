@@ -283,7 +283,6 @@ def load_vllm_model_and_tokenizer(
     **llm_kwargs: Any,
 ) -> Tuple[Any, PreTrainedTokenizerBase]:
     """Load the model through vLLM for inference."""
-    _check_vram(required_gb=10.0)
 
     logger.info("Loading tokenizer from %s", model_id)
     tokenizer = AutoTokenizer.from_pretrained(
