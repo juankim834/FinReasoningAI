@@ -196,9 +196,9 @@ def safe_calculate(expression: str) -> float | str:
 
 
 
-def _tool_system_prompt(tools: Optional[list[dict[str, Any]]]) -> str:
+def _tool_system_prompt() -> str:
     """Build the system prompt used for tool-augmented inference."""
-    del tools
+    # tools are described inline in _TOOL_PROMPT_INTRO; no tools list needed
     return f"{COT_SYSTEM_PROMPT}\n\n{_TOOL_PROMPT_INTRO}"
 
 
@@ -214,7 +214,7 @@ def _build_messages(
     """Construct a chat history for the current request."""
     system_prompt = DIRECT_SYSTEM_PROMPT
     if use_tools:
-        system_prompt = _tool_system_prompt(tools)
+        system_prompt = _tool_system_prompt()  # no longer accepts/deletes tools
     elif use_cot:
         system_prompt = COT_SYSTEM_PROMPT
 
@@ -228,6 +228,7 @@ def _build_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
     ]
+
 
 
 
@@ -332,7 +333,14 @@ def _generate_once_transformers(
     question: str,
 ) -> str:
     """Run a single Hugging Face generation and decode the new tokens."""
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1900, padding=False).to(model.device)
+    # Derive input length budget from model's actual context window
+    max_model_len = getattr(model.config, "max_position_embeddings", 4096)
+    max_input_len = max(512, max_model_len - max_new_tokens)
+
+    inputs = tokenizer(
+        prompt, return_tensors="pt", truncation=True,
+        max_length=max_input_len, padding=False
+    ).to(model.device)
     do_sample = temperature > 0
     processors = LogitsProcessorList()
     if use_numeric_bias:
@@ -402,40 +410,31 @@ def generate_with_tools(
     tokenizer: PreTrainedTokenizerBase,
     question: str,
     context: str = "",
-    tools: list[dict[str, Any]] = FINANCIAL_TOOLS,
+    tools: list[dict[str, Any]] = FINANCIAL_TOOLS,  # described in system prompt only
     max_new_tokens: int = 2048,
     max_tool_rounds: int = 6,
 ) -> dict[str, Any]:
-    """Run a strict tool-augmented reasoning loop and return the final answer.
+    # `tools` intentionally not passed to template — described in _TOOL_PROMPT_INTRO
+    _ = tools
 
-    Does NOT pass ``tools`` to the chat template to avoid Qwen's native
-    tool-call schema overriding the custom ``<tool_call>`` system prompt.
-    Tool instructions are injected via ``_TOOL_PROMPT_INTRO`` instead.
-    """
-    del tools  # tool list is described in the system prompt; not passed to template
-    messages = _build_messages(question=question, context=context, use_cot=True, use_tools=True)
+    messages = _build_messages(question=question, context=context, use_tools=True)
+    #                                                               ^ dropped use_cot=True
     tool_calls: list[dict[str, Any]] = []
     full_outputs: list[str] = []
     last_call_signature: Optional[str] = None
 
     for _ in range(max_tool_rounds + 1):
-        # Omit tools= so Qwen's template does not inject a conflicting schema.
         prompt = _apply_chat_template(tokenizer, messages)
         raw_output = _generate_once(
-            model,
-            tokenizer,
-            prompt,
+            model, tokenizer, prompt,
             max_new_tokens=max_new_tokens,
-            temperature=0.0,
-            top_p=0.9,
+            temperature=0.0, top_p=0.9,
             question=question,
         )
         full_outputs.append(raw_output)
-
         parsed = parse_tool_call_from_output(raw_output)
 
         if parsed is None:
-            # No tool_call block — model is emitting its final answer.
             answer, _ = extract_final_answer(raw_output)
             return {
                 "answer": answer,
@@ -459,30 +458,33 @@ def generate_with_tools(
             }
 
         call = parsed["call"]
-
-        # Repetition guard: if the model emits the exact same tool call twice in a
-        # row the loop is stuck. Treat it as the final turn to avoid an infinite cycle.
         call_signature = json.dumps(call, sort_keys=True)
+
         if call_signature == last_call_signature:
             logger.warning(
                 "Repeated identical tool call detected (%s %s); breaking loop.",
-                call["name"],
-                call["arguments"],
+                call["name"], call["arguments"],
             )
             answer, _ = extract_final_answer(raw_output)
             return {
                 "answer": answer,
                 "tool_calls": tool_calls,
-                "n_rounds": len(tool_calls),
+                "n_rounds": len(tool_calls) + 1,  # count the attempted repeated round
                 "full_output": "\n\n---\n\n".join(full_outputs),
-                "tool_violation": len(tool_calls) == 0,
+                "tool_violation": False,  # model did use tools; it's stuck, not absent
                 "max_rounds_exceeded": False,
             }
-        last_call_signature = call_signature
 
+        last_call_signature = call_signature
         tool_result = dispatch_tool_call(call["name"], call["arguments"])
         tool_calls.append({"name": call["name"], "arguments": call["arguments"], "result": tool_result})
-        messages.append({"role": "assistant", "content": raw_output})
+
+        # Trim raw_output to only the tool_call block before appending to history,
+        # so trailing noise after </tool_call> doesn't contaminate future turns.
+        tool_call_end = raw_output.find("</tool_call>")
+        clean_assistant_turn = raw_output[:tool_call_end + len("</tool_call>")] if tool_call_end != -1 else raw_output
+
+        messages.append({"role": "assistant", "content": clean_assistant_turn})
         messages.append({
             "role": "tool",
             "name": call["name"],
@@ -495,7 +497,7 @@ def generate_with_tools(
         "tool_calls": tool_calls,
         "n_rounds": len(tool_calls),
         "full_output": "\n\n---\n\n".join(full_outputs),
-        "tool_violation": len(tool_calls) == 0,
+        "tool_violation": False,  # model used tools; it just ran out of rounds
         "max_rounds_exceeded": True,
     }
 
