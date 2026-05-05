@@ -48,7 +48,7 @@ _TOOL_PROMPT_INTRO = (
     "7. If the original question asks for multiple outputs, you must compute and return every requested output. Do not return only the last value.\n\n"
 
     "=== TOOL CALL FORMAT ===\n"
-    '<tool_call>{\"name\":\"arithmetic\",\"arguments\":{\"a\":394.3,\"b\":365.8,\"operation\":\"subtract\"}}</tool_call>\n\n"
+    '<tool_call>{"name":"arithmetic","arguments":{"a":394.3,"b":365.8,"operation":"subtract"}}</tool_call>\n\n'
 
     "=== FINAL ANSWER FORMAT ===\n"
     "Always start the final response with `Final Answer:`.\n\n"
