@@ -36,8 +36,11 @@ _TOOL_PROMPT_INTRO = (
     "For EVERY numeric computation — addition, subtraction, division, multiplication, "
     "percentage change, ratio, growth rate, or CAGR — you MUST call a tool. "
     "Do NOT compute numbers in your head.\n\n"
+    "CRITICAL — read each tool result carefully and use it as input to your next step. "
+    "Never state a number that differs from the tool result you just received.\n\n"
     "Tool-call format:\n"
-    "Emit exactly ONE JSON object inside <tool_call> tags, and nothing else in that assistant turn.\n\n"
+    "Emit exactly ONE JSON object inside <tool_call>...</tool_call> tags per assistant turn, "
+    "with the closing </tool_call> tag present. Nothing else may appear in that turn.\n\n"
     "Use this exact format:\n"
     '<tool_call>{"name":"arithmetic","arguments":{"a":120.0,"b":100.0,"operation":"subtract"}}</tool_call>\n\n'
     "If multiple computations are needed, call one tool, wait for the tool result, "
@@ -45,12 +48,16 @@ _TOOL_PROMPT_INTRO = (
     "Available tools:\n\n"
     "1. arithmetic(a, b, operation)\n"
     "   operation must be one of: add, subtract, multiply, divide, percent_change.\n"
-    "   add computes a + b.\n"
-    "   subtract computes a - b.\n"
-    "   multiply computes a * b.\n"
-    "   divide computes a / b.\n"
-    "   percent_change computes (a - b) / abs(b), where a is the later/new/current value "
-    "and b is the earlier/old/previous value.\n\n"
+    "   add        — computes a + b.\n"
+    "   subtract   — computes a - b.\n"
+    "   multiply   — computes a * b.  Use this to apply a percentage rate to a base value.\n"
+    "                Example: to compute 14% of 200000, call multiply(200000, 0.14) → 28000.\n"
+    "                Example: to compute 5% of 120000, call multiply(120000, 0.05) → 6000.\n"
+    "   divide     — computes a / b.\n"
+    "   percent_change — computes (a - b) / abs(b), where a is the LATER value and b is the\n"
+    "                EARLIER value. Use ONLY to find how much a quantity changed between two\n"
+    "                time periods (e.g. revenue grew from 100 to 120 → percent_change(120, 100)).\n"
+    "                Do NOT use percent_change to apply a rate; use multiply instead.\n\n"
     "2. compound_growth_rate(start_value, end_value, n_periods)\n"
     "   Computes CAGR = (end_value / start_value) ** (1 / n_periods) - 1.\n\n"
     "After all required tool calls are done, output exactly one line:\n"
@@ -396,7 +403,7 @@ def generate_with_tools(
     question: str,
     context: str = "",
     tools: list[dict[str, Any]] = FINANCIAL_TOOLS,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 768,
     max_tool_rounds: int = 6,
 ) -> dict[str, Any]:
     """Run a strict tool-augmented reasoning loop and return the final answer.
@@ -409,6 +416,7 @@ def generate_with_tools(
     messages = _build_messages(question=question, context=context, use_cot=True, use_tools=True)
     tool_calls: list[dict[str, Any]] = []
     full_outputs: list[str] = []
+    last_call_signature: Optional[str] = None
 
     for _ in range(max_tool_rounds + 1):
         # Omit tools= so Qwen's template does not inject a conflicting schema.
@@ -451,6 +459,27 @@ def generate_with_tools(
             }
 
         call = parsed["call"]
+
+        # Repetition guard: if the model emits the exact same tool call twice in a
+        # row the loop is stuck. Treat it as the final turn to avoid an infinite cycle.
+        call_signature = json.dumps(call, sort_keys=True)
+        if call_signature == last_call_signature:
+            logger.warning(
+                "Repeated identical tool call detected (%s %s); breaking loop.",
+                call["name"],
+                call["arguments"],
+            )
+            answer, _ = extract_final_answer(raw_output)
+            return {
+                "answer": answer,
+                "tool_calls": tool_calls,
+                "n_rounds": len(tool_calls),
+                "full_output": "\n\n---\n\n".join(full_outputs),
+                "tool_violation": len(tool_calls) == 0,
+                "max_rounds_exceeded": False,
+            }
+        last_call_signature = call_signature
+
         tool_result = dispatch_tool_call(call["name"], call["arguments"])
         tool_calls.append({"name": call["name"], "arguments": call["arguments"], "result": tool_result})
         messages.append({"role": "assistant", "content": raw_output})

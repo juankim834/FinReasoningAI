@@ -12,6 +12,8 @@ from tools.financial_tools import TOOL_REGISTRY
 logger = logging.getLogger(__name__)
 
 _TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# Detects any <tool_call> opening tag so we can catch unclosed / multi-call emissions.
+_TOOL_CALL_OPEN_PATTERN = re.compile(r"<tool_call>", re.DOTALL)
 
 # Allowed tool names and valid arithmetic operations for schema validation.
 _ALLOWED_TOOLS = {"arithmetic", "compound_growth_rate"}
@@ -91,6 +93,18 @@ def parse_tool_call_from_output(model_output: str) -> Optional[dict[str, Any]]:
     matches = _TOOL_CALL_PATTERN.findall(model_output)
 
     if not matches:
+        # Check whether the model emitted <tool_call> without a closing tag.
+        # This happens when the model concatenates multiple raw calls or generation
+        # is truncated mid-tag (e.g. by max_new_tokens).
+        open_count = len(_TOOL_CALL_OPEN_PATTERN.findall(model_output))
+        if open_count > 0:
+            msg = (
+                f"Found {open_count} <tool_call> opening tag(s) but no matching "
+                "</tool_call> closing tag. The model emitted multiple tool calls in "
+                "one turn or generation was truncated. Treating as malformed."
+            )
+            logger.warning(msg)
+            return {"ok": False, "call": None, "error": msg}
         return None
 
     if len(matches) > 1:
