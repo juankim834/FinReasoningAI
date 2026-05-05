@@ -12,7 +12,13 @@ import re
 from typing import Any, Optional
 
 import torch
-from transformers import LogitsProcessor, LogitsProcessorList, PreTrainedTokenizerBase
+from transformers import (
+    LogitsProcessor,
+    LogitsProcessorList,
+    PreTrainedTokenizerBase,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 from src.tools.tool_router import dispatch_tool_call, parse_tool_call_from_output
 from tools.financial_tools import FINANCIAL_TOOLS
@@ -30,40 +36,38 @@ COT_SYSTEM_PROMPT = (
 )
 
 _TOOL_PROMPT_INTRO = (
-    "You are solving a financial QA problem using tools.\n\n"
-    "For this benchmark, every question requires numeric computation. "
-    "You MUST call at least one tool before giving the final answer.\n\n"
-    "For EVERY numeric computation — addition, subtraction, division, multiplication, "
-    "percentage change, ratio, growth rate, or CAGR — you MUST call a tool. "
-    "Do NOT compute numbers in your head.\n\n"
-    "CRITICAL — read each tool result carefully and use it as input to your next step. "
-    "Never state a number that differs from the tool result you just received.\n\n"
-    "Tool-call format:\n"
-    "Emit exactly ONE JSON object inside <tool_call>...</tool_call> tags per assistant turn, "
-    "with the closing </tool_call> tag present. Nothing else may appear in that turn.\n\n"
-    "Use this exact format:\n"
-    '<tool_call>{"name":"arithmetic","arguments":{"a":120.0,"b":100.0,"operation":"subtract"}}</tool_call>\n\n'
-    "If multiple computations are needed, call one tool, wait for the tool result, "
-    "then call the next tool. Never emit multiple tool calls in one turn.\n\n"
-    "Available tools:\n\n"
+    "You are FinReasoningAI, a financial reasoning assistant that computes every number with tools.\n\n"
+    "=== STRICT RULES ===\n"
+    "1. NEVER compute a number in your head. For every arithmetic step — add, subtract,\n"
+    "   multiply, divide, percentage, ratio, growth rate, or CAGR — call a tool.\n"
+    "2. When a computation is needed, emit ONLY a single complete tool call. Nothing else.\n"
+    "   No preamble, no explanation, no reasoning text. Just the tag:\n"
+    '   <tool_call>{"name":"arithmetic","arguments":{"a":394.3,"b":365.8,"operation":"subtract"}}</tool_call>\n'
+    "3. After receiving a tool result, you may either:\n"
+    "   a) Emit the next single tool call (if more computation is needed), OR\n"
+    "   b) Emit the final answer on one line: Final Answer: <bare number>\n"
+    "4. NEVER emit multiple tool calls in one turn.\n"
+    "5. ALWAYS use the number from the tool result as input to the next step.\n"
+    "   Never restate or substitute a different number.\n\n"
+    "=== FINAL ANSWER FORMAT ===\n"
+    "Final Answer: <number only>\n"
+    "No units, no explanation, no commas, no currency symbols, no percentage signs.\n\n"
+    "=== AVAILABLE TOOLS ===\n\n"
     "1. arithmetic(a, b, operation)\n"
-    "   operation must be one of: add, subtract, multiply, divide, percent_change.\n"
-    "   add        — computes a + b.\n"
-    "   subtract   — computes a - b.\n"
-    "   multiply   — computes a * b.  Use this to apply a percentage rate to a base value.\n"
-    "                Example: to compute 14% of 200000, call multiply(200000, 0.14) → 28000.\n"
-    "                Example: to compute 5% of 120000, call multiply(120000, 0.05) → 6000.\n"
-    "   divide     — computes a / b.\n"
-    "   percent_change — computes (a - b) / abs(b), where a is the LATER value and b is the\n"
-    "                EARLIER value. Use ONLY to find how much a quantity changed between two\n"
-    "                time periods (e.g. revenue grew from 100 to 120 → percent_change(120, 100)).\n"
-    "                Do NOT use percent_change to apply a rate; use multiply instead.\n\n"
+    "   operation: add | subtract | multiply | divide | percent_change\n\n"
+    "   add        — a + b\n"
+    "   subtract   — a - b\n"
+    "   multiply   — a * b\n"
+    "     ↳ Use this to apply a percentage rate to a base value.\n"
+    "       14% of 200000  →  multiply(200000, 0.14)  =  28000\n"
+    "        5% of 120000  →  multiply(120000, 0.05)  =   6000\n"
+    "   divide     — a / b\n"
+    "   percent_change — (a - b) / |b|\n"
+    "     ↳ Use ONLY for period-over-period relative change.\n"
+    "       Revenue 100→120  →  percent_change(120, 100)  =  0.20\n"
+    "       Do NOT use percent_change to apply a rate; use multiply instead.\n\n"
     "2. compound_growth_rate(start_value, end_value, n_periods)\n"
-    "   Computes CAGR = (end_value / start_value) ** (1 / n_periods) - 1.\n\n"
-    "After all required tool calls are done, output exactly one line:\n"
-    "Final Answer: <number only>\n\n"
-    "Do not include units, explanation, formulas, commas, currency symbols, "
-    "percentage signs, or extra text after the final answer."
+    "   CAGR = (end_value / start_value)^(1/n_periods) − 1\n"
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -91,6 +95,44 @@ _SAFE_OPS = {
     ast.USub: operator.neg,
     ast.UAdd: operator.pos,
 }
+
+
+class _StopSequenceCriteria(StoppingCriteria):
+    """Halt Transformers generation as soon as any stop string appears in the output."""
+
+    def __init__(
+        self,
+        stop_sequences: list[str],
+        tokenizer: PreTrainedTokenizerBase,
+        prompt_len: int,
+    ) -> None:
+        self._stop_sequences = stop_sequences
+        self._tokenizer = tokenizer
+        self._prompt_len = prompt_len
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
+        generated = self._tokenizer.decode(
+            input_ids[0, self._prompt_len:], skip_special_tokens=False
+        )
+        return any(seq in generated for seq in self._stop_sequences)
+
+
+def _tool_result(
+    answer: Optional[str],
+    tool_calls: list[dict[str, Any]],
+    full_outputs: list[str],
+    *,
+    max_rounds_exceeded: bool,
+) -> dict[str, Any]:
+    """Assemble the standard return dict for generate_with_tools."""
+    return {
+        "answer": answer,
+        "tool_calls": tool_calls,
+        "n_rounds": len(tool_calls),
+        "full_output": "\n\n---\n\n".join(full_outputs),
+        "tool_violation": len(tool_calls) == 0,
+        "max_rounds_exceeded": max_rounds_exceeded,
+    }
 
 
 class NumericBiasLogitsProcessor(LogitsProcessor):
@@ -129,18 +171,34 @@ def _is_vllm_model(model: Any) -> bool:
 
 
 
-def _build_vllm_sampling_params(*, temperature: float, top_p: float, max_new_tokens: int, n: int = 1) -> Any:
-    """Create vLLM sampling parameters while tolerating version drift."""
+def _build_vllm_sampling_params(
+    *,
+    temperature: float,
+    top_p: float,
+    max_new_tokens: int,
+    n: int = 1,
+    extra_stop: list[str] | None = None,
+) -> Any:
+    """Create vLLM sampling parameters while tolerating version drift.
+
+    ``extra_stop`` allows callers to add custom stop strings (e.g. ``["</tool_call>"]``)
+    on top of the standard EOS tokens.  ``include_stop_str_in_output=True`` is
+    requested when supported so the closing tag is preserved in the output text and
+    the parser can find the complete ``<tool_call>…</tool_call>`` block without a
+    post-hoc repair step.
+    """
     from importlib import import_module
 
     SamplingParams = import_module("vllm").SamplingParams
     supported = set(inspect.signature(SamplingParams).parameters)
+    stop_strs = ["<|im_end|>", "<|endoftext|>"] + (extra_stop or [])
     params = {
         "n": n,
         "temperature": temperature,
         "top_p": top_p if temperature > 0 else 1.0,
         "max_tokens": max_new_tokens,
-        "stop": ["<|im_end|>", "<|endoftext|>"],
+        "stop": stop_strs,
+        "include_stop_str_in_output": True,
     }
     return SamplingParams(**{key: value for key, value in params.items() if key in supported})
 
@@ -154,6 +212,7 @@ def _vllm_generate_texts(
     top_p: float = 0.9,
     max_new_tokens: int = 256,
     n: int = 1,
+    extra_stop: list[str] | None = None,
 ) -> list[list[str]]:
     """Generate one or more completions for each prompt with vLLM."""
     outputs = model.generate(
@@ -163,6 +222,7 @@ def _vllm_generate_texts(
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             n=n,
+            extra_stop=extra_stop,
         ),
     )
     return [[completion.text for completion in request_output.outputs] for request_output in outputs]
@@ -196,10 +256,15 @@ def safe_calculate(expression: str) -> float | str:
 
 
 
-def _tool_system_prompt() -> str:
-    """Build the system prompt used for tool-augmented inference."""
-    # tools are described inline in _TOOL_PROMPT_INTRO; no tools list needed
-    return f"{COT_SYSTEM_PROMPT}\n\n{_TOOL_PROMPT_INTRO}"
+def _tool_system_prompt(tools: Optional[list[dict[str, Any]]]) -> str:
+    """Build the system prompt used for tool-augmented inference.
+
+    Intentionally does NOT prepend COT_SYSTEM_PROMPT: chain-of-thought preamble
+    encourages the model to write long reasoning before tool calls, which inflates
+    token usage and triggers multi-call emissions in a single turn.
+    """
+    del tools
+    return _TOOL_PROMPT_INTRO
 
 
 
@@ -214,7 +279,7 @@ def _build_messages(
     """Construct a chat history for the current request."""
     system_prompt = DIRECT_SYSTEM_PROMPT
     if use_tools:
-        system_prompt = _tool_system_prompt()  # no longer accepts/deletes tools
+        system_prompt = _tool_system_prompt(tools)
     elif use_cot:
         system_prompt = COT_SYSTEM_PROMPT
 
@@ -228,7 +293,6 @@ def _build_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
     ]
-
 
 
 
@@ -331,23 +395,23 @@ def _generate_once_transformers(
     top_p: float,
     use_numeric_bias: bool,
     question: str,
+    stop_sequences: list[str] | None = None,
 ) -> str:
     """Run a single Hugging Face generation and decode the new tokens."""
-    # Derive input length budget from model's actual context window
-    max_model_len = getattr(model.config, "max_position_embeddings", 4096)
-    max_input_len = max(512, max_model_len - max_new_tokens)
-
-    inputs = tokenizer(
-        prompt, return_tensors="pt", truncation=True,
-        max_length=max_input_len, padding=False
-    ).to(model.device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1900, padding=False).to(model.device)
+    prompt_len = inputs["input_ids"].shape[1]
     do_sample = temperature > 0
+
     processors = LogitsProcessorList()
     if use_numeric_bias:
         numeric_processor = NumericBiasLogitsProcessor(tokenizer)
-        if re.search(r"(how much|how many|calculate|compute|ratio|margin|growth|rate)", question, re.IGNORECASE):
+        if re.search(r"(how much|how many|calculate|compute|ratio|margin|growth|rate)", question, re.IGNORECASE):
             numeric_processor.activate()
             processors.append(numeric_processor)
+
+    criteria = StoppingCriteriaList()
+    if stop_sequences:
+        criteria.append(_StopSequenceCriteria(stop_sequences, tokenizer, prompt_len))
 
     with torch.no_grad():
         output_ids = model.generate(
@@ -363,10 +427,10 @@ def _generate_once_transformers(
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             logits_processor=processors if processors else None,
+            stopping_criteria=criteria if criteria else None,
         )
-    new_ids = output_ids[0, inputs["input_ids"].shape[1]:]
+    new_ids = output_ids[0, prompt_len:]
     return tokenizer.decode(new_ids, skip_special_tokens=False)
-
 
 
 def _generate_once(
@@ -379,6 +443,7 @@ def _generate_once(
     top_p: float,
     use_numeric_bias: bool = False,
     question: str = "",
+    stop: list[str] | None = None,
 ) -> str:
     """Backend-agnostic single generation helper."""
     if _is_vllm_model(model):
@@ -389,6 +454,7 @@ def _generate_once(
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             n=1,
+            extra_stop=stop,
         )[0][0]
     if tokenizer is None:
         raise ValueError("tokenizer is required for Transformers generation.")
@@ -401,8 +467,17 @@ def _generate_once(
         top_p=top_p,
         use_numeric_bias=use_numeric_bias,
         question=question,
+        stop_sequences=stop,
     )
 
+
+
+_TOOL_CALL_STOP = ["</tool_call>"]
+_CORRECTION_MSG = (
+    "Your last response was not a valid tool call. "
+    "Emit exactly one complete tool call and nothing else:\n"
+    '<tool_call>{"name":"arithmetic","arguments":{"a":...,"b":...,"operation":"..."}}</tool_call>'
+)
 
 
 def generate_with_tools(
@@ -410,96 +485,122 @@ def generate_with_tools(
     tokenizer: PreTrainedTokenizerBase,
     question: str,
     context: str = "",
-    tools: list[dict[str, Any]] = FINANCIAL_TOOLS,  # described in system prompt only
-    max_new_tokens: int = 2048,
-    max_tool_rounds: int = 6,
+    tools: list[dict[str, Any]] = FINANCIAL_TOOLS,
+    max_new_tokens: int = 384,
+    max_tool_rounds: int = 12,
+    max_retries: int = 2,
 ) -> dict[str, Any]:
-    # `tools` intentionally not passed to template — described in _TOOL_PROMPT_INTRO
-    _ = tools
+    """Run a strict one-tool-call-per-round loop and return the final answer.
 
-    messages = _build_messages(question=question, context=context, use_tools=True)
-    #                                                               ^ dropped use_cot=True
+    Design decisions vs. the old implementation
+    -------------------------------------------
+    * use_cot=False: CoT preamble encourages long explanations before tool calls,
+      wasting the per-round token budget and triggering multi-call emissions.
+    * max_new_tokens=384 per round: enough for one compact tool-call JSON.
+    * stop=["</tool_call>"]: generation halts on the closing tag, so the loop
+      never receives a truncated or multi-call turn.
+    * Closing-tag repair: if include_stop_str_in_output is unsupported, the tag
+      is restored so the parser always sees a complete block.
+    * Normalized assistant message: only a clean <tool_call>{...}</tool_call> is
+      fed back; raw_output preamble stays in full_outputs for debugging only.
+    * role="user" for tool results: avoids Qwen native tool-call schema conflict.
+    * Correction retries: malformed calls get a repair prompt instead of early exit.
+    """
+    del tools  # described in the system prompt; not passed to the chat template
+
+    messages = _build_messages(question=question, context=context, use_cot=False, use_tools=True)
     tool_calls: list[dict[str, Any]] = []
     full_outputs: list[str] = []
     last_call_signature: Optional[str] = None
+    retries_remaining = max_retries
 
-    for _ in range(max_tool_rounds + 1):
+    for _ in range(max_tool_rounds + max_retries + 1):
         prompt = _apply_chat_template(tokenizer, messages)
         raw_output = _generate_once(
-            model, tokenizer, prompt,
+            model,
+            tokenizer,
+            prompt,
             max_new_tokens=max_new_tokens,
-            temperature=0.0, top_p=0.9,
+            temperature=0.0,
+            top_p=0.9,
             question=question,
+            stop=_TOOL_CALL_STOP,
         )
         full_outputs.append(raw_output)
+
+        # Restore closing tag when the backend strips the stop string.
+        if "<tool_call>" in raw_output and "</tool_call>" not in raw_output:
+            raw_output = raw_output.rstrip() + "</tool_call>"
+            full_outputs[-1] = raw_output
+
         parsed = parse_tool_call_from_output(raw_output)
 
+        # ── No tool call block → treat as final answer turn ───────────────
         if parsed is None:
             answer, _ = extract_final_answer(raw_output)
-            return {
-                "answer": answer,
-                "tool_calls": tool_calls,
-                "n_rounds": len(tool_calls),
-                "full_output": "\n\n---\n\n".join(full_outputs),
-                "tool_violation": len(tool_calls) == 0,
-                "max_rounds_exceeded": False,
-            }
+            return _tool_result(answer, tool_calls, full_outputs, max_rounds_exceeded=False)
 
+        # ── Malformed call → correction retry ────────────────────────────
         if not parsed["ok"]:
-            logger.warning("Malformed tool call: %s", parsed["error"])
-            answer, _ = extract_final_answer(raw_output)
-            return {
-                "answer": answer,
-                "tool_calls": tool_calls,
-                "n_rounds": len(tool_calls),
-                "full_output": "\n\n---\n\n".join(full_outputs),
-                "tool_violation": len(tool_calls) == 0,
-                "max_rounds_exceeded": False,
-            }
+            logger.warning(
+                "Malformed tool call (retries_remaining=%d): %s",
+                retries_remaining,
+                parsed["error"],
+            )
+            full_outputs.append(f"[PARSE_ERROR: {parsed['error']}]")
+            if retries_remaining <= 0:
+                answer, _ = extract_final_answer(raw_output)
+                return _tool_result(answer, tool_calls, full_outputs, max_rounds_exceeded=False)
+            retries_remaining -= 1
+            messages.append({"role": "user", "content": _CORRECTION_MSG})
+            continue
 
         call = parsed["call"]
-        call_signature = json.dumps(call, sort_keys=True)
 
+        # ── Repetition guard ──────────────────────────────────────────────
+        call_signature = json.dumps(call, sort_keys=True)
         if call_signature == last_call_signature:
             logger.warning(
-                "Repeated identical tool call detected (%s %s); breaking loop.",
-                call["name"], call["arguments"],
+                "Repeated identical tool call (%s %s); breaking loop.",
+                call["name"],
+                call["arguments"],
             )
             answer, _ = extract_final_answer(raw_output)
-            return {
-                "answer": answer,
-                "tool_calls": tool_calls,
-                "n_rounds": len(tool_calls) + 1,  # count the attempted repeated round
-                "full_output": "\n\n---\n\n".join(full_outputs),
-                "tool_violation": False,  # model did use tools; it's stuck, not absent
-                "max_rounds_exceeded": False,
-            }
-
+            return _tool_result(answer, tool_calls, full_outputs, max_rounds_exceeded=False)
         last_call_signature = call_signature
-        tool_result = dispatch_tool_call(call["name"], call["arguments"])
-        tool_calls.append({"name": call["name"], "arguments": call["arguments"], "result": tool_result})
+        retries_remaining = max_retries  # reset on each valid call
 
-        # Trim raw_output to only the tool_call block before appending to history,
-        # so trailing noise after </tool_call> doesn't contaminate future turns.
-        tool_call_end = raw_output.find("</tool_call>")
-        clean_assistant_turn = raw_output[:tool_call_end + len("</tool_call>")] if tool_call_end != -1 else raw_output
-
-        messages.append({"role": "assistant", "content": clean_assistant_turn})
-        messages.append({
-            "role": "tool",
+        # ── Dispatch ──────────────────────────────────────────────────────
+        tool_result_data = dispatch_tool_call(call["name"], call["arguments"])
+        tool_calls.append({
             "name": call["name"],
-            "content": json.dumps(tool_result, ensure_ascii=False),
+            "arguments": call["arguments"],
+            "result": tool_result_data,
+        })
+
+        # Feed back only the normalized call — not raw_output, which may
+        # contain preamble text that pollutes the next turn.
+        normalized_call = (
+            "<tool_call>"
+            + json.dumps({"name": call["name"], "arguments": call["arguments"]}, ensure_ascii=False)
+            + "</tool_call>"
+        )
+        messages.append({"role": "assistant", "content": normalized_call})
+
+        # role="user" (not role="tool") avoids Qwen native tool-call schema.
+        result_text = json.dumps(tool_result_data, ensure_ascii=False)
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Tool result: {result_text}\n\n"
+                "Now either emit the next single tool call, or — if all "
+                "computations are done — output exactly:\n"
+                "Final Answer: <bare number only>"
+            ),
         })
 
     answer, _ = extract_final_answer(full_outputs[-1])
-    return {
-        "answer": answer,
-        "tool_calls": tool_calls,
-        "n_rounds": len(tool_calls),
-        "full_output": "\n\n---\n\n".join(full_outputs),
-        "tool_violation": False,  # model used tools; it just ran out of rounds
-        "max_rounds_exceeded": True,
-    }
+    return _tool_result(answer, tool_calls, full_outputs, max_rounds_exceeded=True)
 
 
 
