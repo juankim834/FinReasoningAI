@@ -76,6 +76,12 @@ _TOOL_PROMPT_INTRO = (
     "   Example: 2% dividend on 200000 stock value -> multiply(200000, 0.02).\n"
     "   percent_change — use ONLY for period-over-period relative change.\n\n"
     "2. compound_growth_rate(start_value, end_value, n_periods)\n"
+
+    "=== FINANCIAL DECISION RULES ===\n"
+    "For debt repayment allocation with no prepayment penalties, allocate payments first to the loan with the highest APR, then the next highest APR, until the available repayment amount is exhausted.\n"
+    "Interest savings from repayment equals repayment_amount * APR.\n"
+    "For equal proportional repayment, allocate the repayment amount in proportion to each loan's balance.\n"
+    "If the question asks for optimal allocation and savings relative to another strategy, compute both strategies before giving the final answer.\n\n"
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
