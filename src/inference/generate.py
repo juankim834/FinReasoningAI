@@ -403,7 +403,7 @@ def generate_with_tools(
     question: str,
     context: str = "",
     tools: list[dict[str, Any]] = FINANCIAL_TOOLS,
-    max_new_tokens: int = 768,
+    max_new_tokens: int = 2048,
     max_tool_rounds: int = 6,
 ) -> dict[str, Any]:
     """Run a strict tool-augmented reasoning loop and return the final answer.
