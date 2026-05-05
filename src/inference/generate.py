@@ -37,41 +37,45 @@ COT_SYSTEM_PROMPT = (
 
 _TOOL_PROMPT_INTRO = (
     "You are FinReasoningAI, a financial reasoning assistant that computes every number with tools.\n\n"
+
     "=== STRICT RULES ===\n"
-    "1. NEVER compute a number in your head. For every arithmetic step — add, subtract,\n"
-    "   multiply, divide, percentage, ratio, growth rate, or CAGR — call a tool.\n"
-    "2. When a computation is needed, emit ONLY a single complete tool call. Nothing else.\n"
-    "   No preamble, no explanation, no reasoning text. Just the tag:\n"
-    '   <tool_call>{"name":"arithmetic","arguments":{"a":394.3,"b":365.8,"operation":"subtract"}}</tool_call>\n'
-    "3. After receiving a tool result, you may either:\n"
-    "   a) Emit the next single tool call (if more computation is needed), OR\n"
-    "   b) Emit the final answer on one line: Final Answer: <bare number>\n"
-    "4. NEVER emit multiple tool calls in one turn.\n"
-    "5. ALWAYS use the number from the tool result as input to the next step.\n"
-    "   Never restate or substitute a different number.\n\n"
+    "1. Use tools ONLY for numeric computations.\n"
+    "2. If the question can be answered directly from the context without numeric computation, do not call a tool.\n"
+    "3. NEVER compute a number in your head. For every arithmetic step — add, subtract, multiply, divide, percentage, ratio, growth rate, CAGR, interest, profit, return, or present value — call a tool.\n"
+    "4. When a computation is needed, emit ONLY a single complete tool call. Nothing else.\n"
+    "5. NEVER emit multiple tool calls in one turn.\n"
+    "6. ALWAYS use the number from the tool result as input to the next step. Never restate or substitute a different number.\n"
+    "7. If the original question asks for multiple outputs, you must compute and return every requested output. Do not return only the last value.\n\n"
+
+    "=== TOOL CALL FORMAT ===\n"
+    '<tool_call>{\"name\":\"arithmetic\",\"arguments\":{\"a\":394.3,\"b\":365.8,\"operation\":\"subtract\"}}</tool_call>\n\n"
+
     "=== FINAL ANSWER FORMAT ===\n"
-    "If the question asks for a numeric value, use:\n"
+    "Always start the final response with `Final Answer:`.\n\n"
+
+    "If the question asks for a single numeric value, use:\n"
     "Final Answer: <number only>\n"
     "No units, no explanation, no commas, no currency symbols, no percentage signs.\n\n"
+
+    "If the question asks for multiple outputs, use:\n"
+    "Final Answer:\n"
+    "1. <label from question>: <value>\n"
+    "2. <label from question>: <value>\n"
+    "3. <label from question>: <value>\n"
+    "Use the same order as the question.\n"
+    "For numeric values, do not use commas, currency symbols, or percentage signs.\n"
+    "Do not include extra explanation.\n\n"
+
     "If the question asks for a name, choice, category, yes/no answer, or comparison, use:\n"
-    "Final Answer: <short answer>\n"
-    "Keep it concise. Do not include reasoning or extra explanation.\n\n"
-    "=== AVAILABLE TOOLS ===\n\n"
+    "Final Answer: <short answer>\n\n"
+
+    "=== AVAILABLE TOOLS ===\n"
     "1. arithmetic(a, b, operation)\n"
-    "   operation: add | subtract | multiply | divide | percent_change\n\n"
-    "   add        — a + b\n"
-    "   subtract   — a - b\n"
-    "   multiply   — a * b\n"
-    "     ↳ Use this to apply a percentage rate to a base value.\n"
-    "       14% of 200000  →  multiply(200000, 0.14)  =  28000\n"
-    "        5% of 120000  →  multiply(120000, 0.05)  =   6000\n"
-    "   divide     — a / b\n"
-    "   percent_change — (a - b) / |b|\n"
-    "     ↳ Use ONLY for period-over-period relative change.\n"
-    "       Revenue 100→120  →  percent_change(120, 100)  =  0.20\n"
-    "       Do NOT use percent_change to apply a rate; use multiply instead.\n\n"
+    "   operation: add | subtract | multiply | divide | percent_change\n"
+    "   multiply — use this to apply a percentage rate to a base value.\n"
+    "   Example: 2% dividend on 200000 stock value -> multiply(200000, 0.02).\n"
+    "   percent_change — use ONLY for period-over-period relative change.\n\n"
     "2. compound_growth_rate(start_value, end_value, n_periods)\n"
-    "   CAGR = (end_value / start_value)^(1/n_periods) − 1\n"
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -85,8 +89,8 @@ _REFUSAL_RE = re.compile(
 )
 # Strict parser: matches the last "Final Answer: <bare number>" line.
 _FINAL_ANSWER_RE = re.compile(
-    r"^\s*Final\s+Answer:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$",
-    re.MULTILINE | re.IGNORECASE,
+    r"Final\s+Answer:\s*(.+)",
+    re.IGNORECASE | re.DOTALL,
 )
 INSUFFICIENT_INFO_RESPONSE = "Insufficient information."
 
@@ -359,24 +363,14 @@ def extract_answer_from_cot_output(raw_output: str) -> str:
 
 
 def extract_final_answer(text: str) -> tuple[Optional[str], bool]:
-    """Extract a strict 'Final Answer: <number>' line from model output.
-
-    Scans for the *last* line matching the pattern so that intermediate
-    tool-call turns don't shadow the real answer.
-
-    Returns:
-        ``(answer_str, False)``  — strict match found; ``answer_str`` is the
-            raw numeric string (e.g. ``"20.0"``).
-        ``(fallback_str, True)`` — no strict match; ``fallback_str`` is the
-            result of the legacy CoT extractor (may be ``None``).
-            ``parse_failed=True`` is recorded for benchmark diagnostics.
-    """
     matches = list(_FINAL_ANSWER_RE.finditer(text))
     if matches:
-        return matches[-1].group(1), False
+        answer = matches[-1].group(1).strip()
+        answer = answer.replace("<|im_end|>", "").replace("<|endoftext|>", "").strip()
+        return answer, False
+
     fallback = extract_answer_from_cot_output(text) or None
     return fallback, True
-
 
 
 def check_grounding(answer: str, context: str, tol: float = 0.02) -> bool:
@@ -597,9 +591,10 @@ def generate_with_tools(
             "role": "user",
             "content": (
                 f"Tool result: {result_text}\n\n"
-                "Now either emit the next single tool call, or — if all "
-                "computations are done — output exactly:\n"
-                "Final Answer: <bare number only>"
+                "Now either emit the next single tool call, or — if all computations are done — "
+                "output the final answer using the required final answer format.\n\n"
+                "If the original question asks for multiple outputs, include all requested outputs "
+                "in the same order as the question. Do not collapse the answer into only the last value."
             ),
         })
 
