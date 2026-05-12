@@ -1,251 +1,286 @@
-# FinReasoning AI
+# FinReasoningAI
 
-A production-grade financial reasoning system built on **Qwen2.5-14B** with **QLoRA** fine-tuning.
-Designed for numerical accuracy, hallucination resistance, and self-hostable deployment on a single A100 80GB GPU.
+FinReasoningAI is a financial reasoning stack built around `Qwen/Qwen2.5-14B-Instruct` with a QLoRA-first training path, reliability-oriented inference, evaluation helpers, and an optional RAG layer.
 
----
+The current repository is centered on:
 
-## Architecture Overview
+- 4-bit model loading and QLoRA adapter application
+- SFT and optional DPO training entry points
+- direct, CoT, self-consistency, and tool-augmented inference
+- evaluation focused on numerical accuracy, parsability, and grounding
+- FAISS-based retrieval for financial documents
+- notebooks for Colab training, evaluation, and demos
 
-```
-Qwen2.5-14B-Instruct  (4-bit NF4, double quantization)
-        │
-        ├── QLoRA Adapters  (r=64, alpha=128, 7 target modules)
-        │
-        ├── SFT Training    (primary stage, TRL SFTTrainer)
-        │   └── Optional DPO  (preference alignment, beta=0.1)
-        │
-        ├── Inference
-        │   ├── Direct answer (default — no CoT in output)
-        │   ├── CoT mode     (<think> scratchpad, stripped post-generation)
-        │   ├── Self-consistency (N=5–10 samples, median/majority vote)
-        │   └── Tool use     (calculator, table parser, RAG retrieve)
-        │
-        └── RAG Extension   (bge-m3 + FAISS + cross-encoder reranking)
-```
+## What Is In This Checkout
 
-### VRAM Budget (Single A100 80GB)
-
-| Phase | Estimated VRAM | Notes |
-|-------|---------------|-------|
-| Inference (4-bit) | ~12 GB | 2048-token context |
-| SFT Training | ~31–38 GB | bs=4, grad_ckpt=True, bf16 |
-| DPO Training | ~28 GB | Two 4-bit model copies |
-| + RAG embedder (bge-m3) | +1.5 GB | CPU inference option |
-| **Peak (SFT + overhead)** | **~42 GB** | Well within 80 GB ✅ |
-
----
-
-## Project Structure
-
-```
+```text
 FinReasoningAI/
-├── requirements.txt
-├── README.md
-├── configs/               # YAML configs (optional override)
-├── data/
-│   ├── raw/               # Raw / synthetic JSONL files
-│   └── processed/         # Tokenized HuggingFace DatasetDict
-├── outputs/               # Training checkpoints and adapters
-├── src/
-│   ├── model/
-│   │   ├── load_model.py      # Load Qwen2.5-14B in 4-bit NF4
-│   │   └── apply_lora.py      # Attach QLoRA adapters
-│   ├── data/
-│   │   ├── schemas.py         # Pydantic schemas (Type A/B/C)
-│   │   ├── synthetic_gen.py   # Generate 5,000 synthetic FinQA pairs
-│   │   └── preprocess.py      # ChatML formatting + tokenization + split
-│   ├── train/
-│   │   ├── sft_train.py       # SFT with TRL SFTTrainer
-│   │   └── dpo_train.py       # Optional DPO second stage
-│   ├── eval/
-│   │   └── evaluate.py        # EM, F1, parsability, grounding metrics
-│   ├── inference/
-│   │   ├── generate.py        # Core inference + tool use + constrained decoding
-│   │   └── self_consistency.py # N-sample aggregation (median/majority)
-│   ├── rag/
-│   │   └── retriever.py       # bge-m3 + FAISS + cross-encoder reranking
-│   └── tools/
-│       └── tool_router.py     # Calculator, table parser, ReAct agent
-└── tests/
-    └── test_robustness.py     # Numerical perturbation, entity swap, unit tests
+|- configs/
+|  `- training_config.yaml
+|- src/
+|  |- eval/
+|  |  `- evaluate.py
+|  |- inference/
+|  |  |- generate.py
+|  |  `- self_consistency.py
+|  |- model/
+|  |  |- apply_lora.py
+|  |  `- load_model.py
+|  |- rag/
+|  |  `- retriever.py
+|  |- tools/
+|  |  `- tool_router.py
+|  `- train/
+|     |- dpo_train.py
+|     `- sft_train.py
+|- tests/
+|  `- test_robustness.py
+|- tools/
+|  |- financial_tools.py
+|  `- number_parser.py
+|- FinReasoningAI_Colab.ipynb
+|- FinReasoningAI_Eval.ipynb
+|- gradio_demo.ipynb
+`- requirements.txt
 ```
 
----
+## Important Repo Note
 
-## Quick Start
+Some training and evaluation code still imports modules under `src.data` such as `src.data.preprocess`. Those files are not present in this checkout, so the data-preparation pipeline documented in older versions of the README is not currently runnable from this repository alone.
 
-### 1. Install dependencies
+What does work in the current codebase:
+
+- model loading and adapter wiring
+- inference CLI and library usage
+- evaluation utilities, assuming you already have prepared data
+- SFT and DPO training entry points, assuming you already have prepared datasets
+- RAG indexing and retrieval
+- robustness and metric tests
+
+## Installation
 
 ```bash
 pip install -r requirements.txt
+```
 
-# Flash Attention 2 (recommended for A100, optional):
+Optional for A100-style environments:
+
+```bash
 pip install flash-attn --no-build-isolation
 ```
 
-### 2. Generate synthetic training data
+## Core Components
+
+### Model loading
+
+`src/model/load_model.py` loads Qwen in 4-bit NF4 with bitsandbytes, performs VRAM checks, and supports both Transformers and vLLM inference backends.
+
+### QLoRA application
+
+`src/model/apply_lora.py` prepares the quantized model for k-bit training and applies LoRA adapters targeting:
+
+- `q_proj`
+- `k_proj`
+- `v_proj`
+- `o_proj`
+- `gate_proj`
+- `up_proj`
+- `down_proj`
+
+### Training
+
+- `src/train/sft_train.py`: supervised fine-tuning entry point
+- `src/train/dpo_train.py`: optional DPO stage on top of an SFT adapter
+
+### Inference
+
+- `src/inference/generate.py`: direct generation, CoT mode, self-consistency, and tool use
+- `src/inference/self_consistency.py`: aggregation for multi-sample decoding
+- `src/tools/tool_router.py`: parses and dispatches `<tool_call>...</tool_call>` payloads
+- `tools/financial_tools.py`: active benchmark tools are `arithmetic` and `compound_growth_rate`
+
+### Evaluation
+
+`src/eval/evaluate.py` provides:
+
+- exact match with numeric tolerance
+- task-aware F1
+- answer parsability
+- grounding checks against context or expressions
+
+### Retrieval / RAG
+
+`src/rag/retriever.py` provides:
+
+- document chunking
+- embedding with `BAAI/bge-m3`
+- FAISS index build/load/query
+- optional reranking with `BAAI/bge-reranker-v2-m3`
+
+## Quick Start
+
+### 1. Run inference
+
+Transformers backend:
 
 ```bash
-# Fast: template-only generation (no GPU required)
-python -m src.data.synthetic_gen --output data/raw/synthetic.jsonl --total 5000 --no_llm
-
-# Full: use Qwen2.5-7B as generator (~16GB VRAM)
-python -m src.data.synthetic_gen --output data/raw/synthetic.jsonl --total 5000
+python -m src.inference.generate ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --adapter_dir outputs/sft_qlora/final_adapter ^
+  --question "What was Apple's revenue growth rate from 2021 to 2022?" ^
+  --context "Apple reported revenues of $394.3B in 2022 and $365.8B in 2021."
 ```
 
-### 3. Preprocess and tokenize
+Tool-augmented inference:
 
 ```bash
-python -m src.data.preprocess \
-    --data_path data/raw/synthetic.jsonl \
-    --model_id Qwen/Qwen2.5-14B-Instruct \
-    --max_length 2048 \
-    --output_dir data/processed
+python -m src.inference.generate ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --adapter_dir outputs/sft_qlora/final_adapter ^
+  --use_tools ^
+  --question "What was the percent change from 365.8 to 394.3?" ^
+  --context "2021 revenue was 365.8 and 2022 revenue was 394.3."
 ```
 
-### 4. Run SFT training
+Self-consistency:
 
 ```bash
-python -m src.train.sft_train \
-    --model_id Qwen/Qwen2.5-14B-Instruct \
-    --data_dir data/processed \
-    --output_dir outputs/sft_qlora \
-    --epochs 3 \
-    --batch_size 4 \
-    --grad_accum 8 \
-    --lr 2e-4 \
-    --max_seq_length 2048
+python -m src.inference.generate ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --adapter_dir outputs/sft_qlora/final_adapter ^
+  --self_consistency_n 8 ^
+  --temperature 0.7 ^
+  --question "What was Apple's free cash flow in 2022?" ^
+  --context "Apple's free cash flow in 2022 was $111.4 billion."
 ```
 
-### 5. (Optional) DPO second stage
+vLLM backend:
 
 ```bash
-# First, construct preference pairs from the SFT model
-# (see src/train/dpo_train.py construct_preference_pairs_from_sft)
-
-python -m src.train.dpo_train \
-    --sft_adapter_dir outputs/sft_qlora/final_adapter \
-    --pref_data_path data/raw/dpo_preferences.jsonl \
-    --output_dir outputs/dpo_qlora \
-    --beta 0.1
+python -m src.inference.generate ^
+  --engine vllm ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --question "What was Apple's net income in 2022?" ^
+  --context "Apple's net income in 2022 was $99.8 billion."
 ```
 
-### 6. Evaluate
+### 2. Run SFT training
+
+This requires an already prepared Hugging Face `DatasetDict` on disk. In the current checkout, the default expected path is `data/processed_fincot_sft`.
 
 ```bash
-python -m src.eval.evaluate \
-    --model_id Qwen/Qwen2.5-14B-Instruct \
-    --adapter_dir outputs/sft_qlora/final_adapter \
-    --test_data data/processed \
-    --output_csv outputs/eval_results.csv
+python -m src.train.sft_train ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --data_dir data/processed_fincot_sft ^
+  --output_dir outputs/sft_qlora ^
+  --num_train_epochs 1 ^
+  --per_device_train_batch_size 4 ^
+  --gradient_accumulation_steps 8 ^
+  --learning_rate 2e-4 ^
+  --max_seq_length 2048
 ```
 
-### 7. Inference
+### 3. Run optional DPO training
+
+This requires an existing SFT adapter and a JSONL preference dataset.
 
 ```bash
-# Direct answer (default)
-python -m src.inference.generate \
-    --model_id Qwen/Qwen2.5-14B-Instruct \
-    --adapter_dir outputs/sft_qlora/final_adapter \
-    --question "What was Apple's revenue growth rate from 2021 to 2022?" \
-    --context "Apple Inc. reported revenues of \$394.3B in 2022, up from \$365.8B in 2021."
-
-# Self-consistency (more accurate, 8× slower)
-python -m src.inference.generate \
-    --self_consistency_n 8 \
-    --temperature 0.7 \
-    --question "..."
-
-# CoT mode
-python -m src.inference.generate --use_cot --question "..."
-
-# Tool-augmented
-python -m src.inference.generate --use_tools --question "..."
+python -m src.train.dpo_train ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --sft_adapter_dir outputs/sft_qlora/final_adapter ^
+  --pref_data_path data/raw/dpo_preferences.jsonl ^
+  --output_dir outputs/dpo_qlora ^
+  --beta 0.1
 ```
 
-### 8. Run tests
+### 4. Evaluate a model
+
+If `--test_data` points to a directory, evaluation loads a saved dataset from disk. If it points to a file, it expects JSONL.
+
+Transformers evaluation with adapter:
 
 ```bash
-# Metric unit tests (no GPU required)
+python -m src.eval.evaluate ^
+  --engine transformers ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --adapter_dir outputs/sft_qlora/final_adapter ^
+  --test_data data/processed_fincot_sft ^
+  --output_csv outputs/eval_results.csv
+```
+
+vLLM evaluation:
+
+```bash
+python -m src.eval.evaluate ^
+  --engine vllm ^
+  --model_id Qwen/Qwen2.5-14B-Instruct ^
+  --test_data data/processed_fincot_sft ^
+  --output_csv outputs/eval_results.csv
+```
+
+### 5. Build and query a RAG index
+
+Build:
+
+```bash
+python -m src.rag.retriever build ^
+  --docs_dir data/raw/filings ^
+  --index_dir outputs/rag_index
+```
+
+Query:
+
+```bash
+python -m src.rag.retriever query ^
+  --index_dir outputs/rag_index ^
+  --question "What was Apple's R&D spending in 2022?"
+```
+
+## Configuration
+
+`configs/training_config.yaml` contains project defaults for:
+
+- model and quantization settings
+- LoRA hyperparameters
+- SFT and DPO training values
+- inference defaults
+- RAG settings
+- evaluation tolerances
+
+Treat it as reference configuration. The current training scripts primarily take CLI arguments directly.
+
+## Tests
+
+Run the CPU-safe metric and aggregation tests:
+
+```bash
 pytest tests/test_robustness.py -v -k "not model_and_tokenizer"
+```
 
-# Full integration tests (requires GPU + FINREASONING_MODEL_ID)
-FINREASONING_MODEL_ID=Qwen/Qwen2.5-14B-Instruct \
-FINREASONING_ADAPTER_DIR=outputs/sft_qlora/final_adapter \
+Run integration tests with a real GPU-backed model:
+
+```bash
+set FINREASONING_MODEL_ID=Qwen/Qwen2.5-14B-Instruct
+set FINREASONING_ADAPTER_DIR=outputs/sft_qlora/final_adapter
 pytest tests/test_robustness.py -v
 ```
 
-### 9. Build RAG index
+## Notebooks
 
-```bash
-# Build
-python -m src.rag.retriever build \
-    --docs_dir data/raw/filings \
-    --index_dir outputs/rag_index
+- `FinReasoningAI_Colab.ipynb`: primary Colab workflow
+- `FinReasoningAI_Eval.ipynb`: evaluation workflow
+- `gradio_demo.ipynb`: demo notebook
+- `outputs/demo_notebook/`: saved notebook outputs
 
-# Query
-python -m src.rag.retriever query \
-    --index_dir outputs/rag_index \
-    --question "What was Apple's R&D spending in 2022?"
-```
+## Datasets
 
----
+The intended datasets are:
 
-## Data Design
-
-### Task Type Mix
-
-| Type | Task | Source | Fraction |
-|------|------|--------|----------|
-| A | Financial QA | FinQA, ConvFinQA, custom | 60% |
-| B | Numerical Reasoning | TAT-QA, synthetic | 30% |
-| C | Structured Analysis (+ CoT) | Custom, LLM-synthesized | 10% |
-
-### CoT Strategy
-
-Training includes `<think>...</think>` blocks for ~10% of samples (all Type C + selected Type A/B). At inference, the **default mode** strips all think blocks. The model retains latent reasoning capacity that improves numerical accuracy even without visible CoT.
-
-To expose the scratchpad: use `--use_cot` flag, or set `use_cot=True` in `generate_answer()`.
-
----
-
-## Key Design Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Base model | Qwen2.5-14B-Instruct | 128k context, strong math, financial tokenization |
-| PEFT | QLoRA r=64, alpha=128 | ~0.5% trainable params, ~38GB peak VRAM |
-| Optimizer | paged_adamw_32bit | Offloads optimizer pages to CPU, saves ~10GB VRAM |
-| Precision | bf16 (not fp16) | Wider dynamic range for financial number magnitudes |
-| CoT density | <10% of training mix | Prevents CoT overfitting on direct-answer tasks |
-| Self-consistency | Median (numeric), majority (text) | Robust to hallucinated outliers |
-| Grounding check | ±2% tolerance on context numbers | Rejects hallucinated numbers not in source |
-
----
-
-## Benchmark Targets
-
-| Benchmark | Metric | Target |
-|-----------|--------|--------|
-| FinQA | Exact Match | ≥55% |
-| ConvFinQA | Exact Match | ≥60% |
-| TAT-QA | Exact Match (numeric) | ≥65% |
-| Internal eval | Parsability Rate | ≥95% |
-| Internal eval | Grounding Rate | ≥85% |
-
----
-
-## Extending the System
-
-- **Add new document types**: extend `chunk_document()` in `retriever.py`
-- **Add new tools**: register in `ToolRouter._tool_map` in `tool_router.py`
-- **Add DPO data**: implement custom preference scoring in `dpo_train.py`
-- **Serve with vLLM**: merge LoRA adapter (`model.merge_and_unload()`) then load with vLLM
-
----
+- training: [TheFinAI/FinCoT](https://huggingface.co/datasets/TheFinAI/FinCoT)
+- evaluation: [FinQA](https://github.com/czyssrs/FinQA)
 
 ## License
 
-All code is MIT-licensed. Model weights are subject to the [Qwen2.5 model license](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct).
-No proprietary APIs are used.
+Code in this repository is MIT-licensed. Base model weights remain subject to the upstream Qwen license:
+
+[Qwen/Qwen2.5-14B-Instruct](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct)
