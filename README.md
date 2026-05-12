@@ -5,7 +5,7 @@ FinReasoningAI is a financial reasoning stack built around `Qwen/Qwen2.5-14B-Ins
 The current repository is centered on:
 
 - 4-bit model loading and QLoRA adapter application
-- SFT and optional DPO training entry points
+- SFT and optional DPO training entry points included for future preference-optimization experiments; DPO was not used for the final submitted adapter
 - direct, CoT, self-consistency, and tool-augmented inference
 - evaluation focused on numerical accuracy, parsability, and grounding
 - FAISS-based retrieval for financial documents
@@ -45,8 +45,6 @@ FinReasoningAI/
 ```
 
 ## Important Repo Note
-
-Some training and evaluation code still imports modules under `src.data` such as `src.data.preprocess`. Those files are not present in this checkout, so the data-preparation pipeline documented in older versions of the README is not currently runnable from this repository alone.
 
 What does work in the current codebase:
 
@@ -253,6 +251,16 @@ Open `gradio_demo.ipynb` on Google Colab and run the cells to interact with a si
 
 Treat it as reference configuration. The current training scripts primarily take CLI arguments directly.
 
+## Adapter Checkpoint
+
+The trained QLoRA adapter checkpoint: [outputs/sft_qlora/final_adapter](https://drive.google.com/drive/folders/1H7DmB45aC6pImOSCvm85iBuUW6JThLnl?usp=drive_link) is not included in this checkout due to size constraints. If you want to run inference or evaluation with the adapter, please download the checkpoint separately and place it under `outputs/sft_qlora/final_adapter`. Please open the link using a Columbia LionMail account.
+
+To run adapter-based inference or evaluation, please download the adapter checkpoint separately and place it under:
+
+```text
+outputs/sft_qlora/final_adapter/
+```
+
 ## Tests
 
 Run the CPU-safe metric and aggregation tests:
@@ -282,6 +290,12 @@ The intended datasets are:
 
 - training: [TheFinAI/FinCoT](https://huggingface.co/datasets/TheFinAI/FinCoT)
 - evaluation: [FinQA](https://github.com/czyssrs/FinQA)
+
+## Limitations
+
+The current numeric parser is an experimental component and still has known edge cases. In particular, percentage-style answers, decimal-to-percent normalization, and final-answer extraction may not always be handled correctly.
+
+Therefore, some automated evaluation errors may reflect parser or formatting artifacts rather than pure reasoning failures. When interpreting the evaluation results, raw model generations and tool execution traces should be checked alongside parsed scores.
 
 ## License
 
