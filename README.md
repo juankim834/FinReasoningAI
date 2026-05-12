@@ -117,7 +117,7 @@ pip install flash-attn --no-build-isolation
 - FAISS index build/load/query
 - optional reranking with `BAAI/bge-reranker-v2-m3`
 
-## Quick Start
+## Example Usage / Quick Start
 
 ### 1. Run inference
 
