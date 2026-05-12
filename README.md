@@ -236,6 +236,10 @@ python -m src.rag.retriever query ^
   --question "What was Apple's R&D spending in 2022?"
 ```
 
+### 6. Run the demo notebook
+
+Open `gradio_demo.ipynb` on Google Colab and run the cells to interact with a simple Gradio interface for asking financial questions.
+
 ## Configuration
 
 `configs/training_config.yaml` contains project defaults for:
